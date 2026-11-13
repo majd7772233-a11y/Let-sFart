@@ -29,6 +29,8 @@ export default function App() {
   const [myPlayerId, setMyPlayerId] = useState<string | null>(null);
   const [mySlot, setMySlot] = useState<0 | 1 | 2 | 3>(0);
   const [lobbyError, setLobbyError] = useState<string | null>(null);
+  const [lobbyBusy, setLobbyBusy] = useState(false);
+  const lobbyBusyRef = useRef(false);
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('disconnected');
 
   const [sfxVolume, setSfxVolume] = useState(0.8);
@@ -316,18 +318,37 @@ export default function App() {
           roomSnapshot={roomSnapshot}
           myPlayerId={myPlayerId}
           connectionStatus={connectionStatus}
+          isSubmitting={lobbyBusy}
           errorMsg={lobbyError}
           onCreateRoom={() => {
+            if (lobbyBusyRef.current) return;
+            lobbyBusyRef.current = true;
+            setLobbyBusy(true);
             setLobbyError(null);
-            netRef.current?.createRoom(playerName, cosmetic).catch((err) => {
-              setLobbyError(err.message || 'تعذر إنشاء الغرفة');
-            });
+            netRef.current
+              ?.createRoom(playerName, cosmetic)
+              .catch((err) => {
+                setLobbyError(err.message || 'تعذر إنشاء الغرفة');
+              })
+              .finally(() => {
+                lobbyBusyRef.current = false;
+                setLobbyBusy(false);
+              });
           }}
           onJoinRoom={(code) => {
+            if (lobbyBusyRef.current) return;
+            lobbyBusyRef.current = true;
+            setLobbyBusy(true);
             setLobbyError(null);
-            netRef.current?.joinRoom(code, playerName, cosmetic).catch((err) => {
-              setLobbyError(err.message || 'تعذر الانضمام للغرفة');
-            });
+            netRef.current
+              ?.joinRoom(code, playerName, cosmetic)
+              .catch((err) => {
+                setLobbyError(err.message || 'تعذر الانضمام للغرفة');
+              })
+              .finally(() => {
+                lobbyBusyRef.current = false;
+                setLobbyBusy(false);
+              });
           }}
           onToggleReady={(r) => netRef.current?.setReady(r)}
           onToggleBots={(b) => netRef.current?.toggleBots(b)}

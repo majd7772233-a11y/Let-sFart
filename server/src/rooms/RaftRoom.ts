@@ -6,6 +6,7 @@ import type {
   ServerProtocolMessage,
 } from '../../../src/shared/protocol.ts';
 import {
+  CLIENT_IP_HEADER_NAME,
   createWebSocketPair,
   createWebSocketUpgradeResponse,
   INTERNAL_HEADER_NAME,
@@ -13,7 +14,12 @@ import {
   type Env,
 } from '../env.ts';
 import { logServerEvent } from '../lib/logger.ts';
-import { SessionRateLimiter } from '../lib/rateLimit.ts';
+import {
+  consumeDurableTokenBucket,
+  HTTP_CHANNEL_LIMITS,
+  type HttpRateChannel,
+  SessionRateLimiter,
+} from '../lib/rateLimit.ts';
 import { isValidRoomCode, normalizeRoomCode } from '../lib/roomCode.ts';
 import { generateResumeToken, hashToken } from '../lib/tokens.ts';
 import { sanitizeCosmeticOrDefault, sanitizePlayerName } from '../lib/validation.ts';
@@ -66,6 +72,12 @@ function isValidSocketAttachment(raw: unknown): raw is SocketAttachment {
   if (!raw || typeof raw !== 'object') return false;
   const att = raw as Partial<SocketAttachment>;
   if (typeof att.authenticated !== 'boolean') return false;
+  if (
+    att.authAttempts !== undefined &&
+    (typeof att.authAttempts !== 'number' || !Number.isInteger(att.authAttempts) || att.authAttempts < 0)
+  ) {
+    return false;
+  }
   if (att.authenticated) {
     return (
       typeof att.playerId === 'string' &&
@@ -165,6 +177,7 @@ export class RaftRoom {
           playerId: null,
           sessionId: null,
           connectionEpoch: 0,
+          authAttempts: att?.authAttempts ?? 0,
         };
         writeSocketAttachment(ws, emptyAtt);
         this.sockets.set(ws, { ws, ...emptyAtt });
@@ -227,6 +240,9 @@ export class RaftRoom {
       if (url.pathname === '/internal/idem-release' && request.method === 'POST') {
         return await this.handleInternalIdemRelease(request);
       }
+      if (url.pathname === '/internal/rate-limit' && request.method === 'POST') {
+        return await this.handleInternalRateLimit(request);
+      }
       if (url.pathname === '/internal/create' && request.method === 'POST') {
         return await this.handleInternalCreate(request);
       }
@@ -267,6 +283,8 @@ export class RaftRoom {
       sessions: this.sessions,
       persistence: this.persistence,
       rateLimiter: this.rateLimiter,
+      consumeDurableRateLimit: (key, capacity, refillPerMs, ttlMs, nowMs) =>
+        consumeDurableTokenBucket(this.sql, key, capacity, refillPerMs, ttlMs, nowMs),
       sendToSocket: (targetWs, msg) => this.sendMsg(targetWs, msg),
       broadcastState: (requestId) => {
         if (!this.room) return;
@@ -364,6 +382,7 @@ export class RaftRoom {
       playerId: null,
       sessionId: null,
       connectionEpoch: 0,
+      authAttempts: att?.authAttempts ?? 0,
     };
     this.sockets.set(ws, binding);
     return binding;
@@ -408,14 +427,16 @@ export class RaftRoom {
       return null;
     }
 
-    let resumeToken = '';
+    // Never return empty or placeholder credentials once the session has activated over WebSocket
+    if (session.connected || session.connectionEpoch > 1) {
+      throw new ProtocolError('SESSION_ALREADY_ACTIVE', ERROR_MESSAGES_AR.SESSION_ALREADY_ACTIVE, 409);
+    }
+
     // Re-issue a fresh one-time resumeToken only while the session has not completed initial WS activation.
     // Never store plaintext resumeToken in room_requests.
-    if (!session.connected && session.connectionEpoch === 1) {
-      resumeToken = generateResumeToken();
-      session.resumeTokenHash = await hashToken(resumeToken);
-      this.persistence.saveSession(session);
-    }
+    const resumeToken = generateResumeToken();
+    session.resumeTokenHash = await hashToken(resumeToken);
+    this.persistence.saveSession(session);
 
     const snapshot = issueNextRoomSnapshot(room, nowMs);
     return {
@@ -428,6 +449,24 @@ export class RaftRoom {
       slot: session.slot,
       snapshot,
     };
+  }
+
+  private async handleInternalRateLimit(request: Request): Promise<Response> {
+    const body = (await request.json()) as { key?: string; channel?: HttpRateChannel };
+    const key = typeof body.key === 'string' ? body.key.trim().slice(0, 128) : '';
+    const channel = body.channel;
+    if (!key || !channel || !(channel in HTTP_CHANNEL_LIMITS)) {
+      throw new ProtocolError('INVALID_MESSAGE', undefined, 400);
+    }
+
+    const nowMs = Date.now();
+    this.persistence.pruneExpiredRequests(nowMs);
+    const cfg = HTTP_CHANNEL_LIMITS[channel];
+    const allowed = consumeDurableTokenBucket(this.sql, `rl:${channel}:${key}`, cfg.capacity, cfg.refillPerMs, 5 * 60_000, nowMs);
+    if (!allowed) {
+      return jsonResponse({ allowed: false, error: makeErrorPayload('RATE_LIMITED') }, 429);
+    }
+    return jsonResponse({ allowed: true }, 200);
   }
 
   private async handleInternalIdemClaim(request: Request): Promise<Response> {
@@ -613,6 +652,13 @@ export class RaftRoom {
   private async handleInternalJoin(request: Request): Promise<Response> {
     const room = this.requireActiveRoom();
     const nowMs = Date.now();
+    const clientIp = request.headers.get(CLIENT_IP_HEADER_NAME)?.trim();
+    if (clientIp) {
+      const cfg = HTTP_CHANNEL_LIMITS.join;
+      if (!consumeDurableTokenBucket(this.sql, `rl:join:${clientIp}`, cfg.capacity, cfg.refillPerMs, 5 * 60_000, nowMs)) {
+        throw new ProtocolError('RATE_LIMITED', undefined, 429);
+      }
+    }
     const body = (await request.json()) as JoinRoomHttpRequest;
     const idempotencyKey =
       typeof body.idempotencyKey === 'string' && body.idempotencyKey.trim().length > 0
@@ -756,6 +802,13 @@ export class RaftRoom {
     if (request.headers.get('upgrade')?.toLowerCase() !== 'websocket') {
       throw new ProtocolError('INVALID_MESSAGE', 'طلب WebSocket غير صالح.', 426);
     }
+    const clientIp = request.headers.get(CLIENT_IP_HEADER_NAME)?.trim();
+    if (clientIp) {
+      const cfg = HTTP_CHANNEL_LIMITS.ws;
+      if (!consumeDurableTokenBucket(this.sql, `rl:ws:${clientIp}`, cfg.capacity, cfg.refillPerMs, 5 * 60_000)) {
+        throw new ProtocolError('RATE_LIMITED', undefined, 429);
+      }
+    }
 
     const [clientSocket, serverSocket] = createWebSocketPair();
     const ctxAny = this.ctx as unknown as { acceptWebSocket?: (ws: WebSocket, tags?: string[]) => void };
@@ -770,6 +823,7 @@ export class RaftRoom {
       playerId: null,
       sessionId: null,
       connectionEpoch: 0,
+      authAttempts: 0,
     };
     writeSocketAttachment(serverSocket, initialAttachment);
 

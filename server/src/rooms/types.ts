@@ -12,6 +12,7 @@ export const ROOM_EMPTY_CLOSE_MS = 30_000;
 export const ROOM_MAX_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours max room lifetime
 export const SESSION_TTL_MS = 2 * 60 * 60 * 1000;
 export const CURRENT_SCHEMA_VERSION = 2;
+export const MAX_WS_AUTH_ATTEMPTS = 3;
 
 export interface SqlCursor<T = Record<string, unknown>> {
   toArray(): T[];
@@ -66,6 +67,7 @@ export interface SocketAttachment {
   playerId: string | null;
   sessionId: string | null;
   connectionEpoch: number;
+  authAttempts?: number;
 }
 
 export interface SocketBinding extends SocketAttachment {

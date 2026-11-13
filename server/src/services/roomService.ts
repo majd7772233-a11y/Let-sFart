@@ -3,7 +3,13 @@ import type {
   JoinRoomHttpRequest,
   RoomSessionCredentials,
 } from '../../../src/shared/protocol.ts';
-import { INTERNAL_HEADER_NAME, INTERNAL_HEADER_VALUE, type Env } from '../env.ts';
+import {
+  CLIENT_IP_HEADER_NAME,
+  INTERNAL_HEADER_NAME,
+  INTERNAL_HEADER_VALUE,
+  type Env,
+} from '../env.ts';
+import type { HttpRateChannel } from '../lib/rateLimit.ts';
 import { generateRoomCode, isValidRoomCode, normalizeRoomCode } from '../lib/roomCode.ts';
 import { hashToken } from '../lib/tokens.ts';
 import { sanitizeCosmeticOrDefault, sanitizePlayerName } from '../lib/validation.ts';
@@ -23,6 +29,24 @@ function makeInternalRequest(path: string, init?: RequestInit): Request {
 
 export function clearRoomServiceCache(): void {
   // No Worker-local mutable idempotency cache remains; state lives durably in Durable Objects.
+}
+
+export async function consumeDurableHttpRateLimit(
+  env: Env,
+  channel: HttpRateChannel,
+  clientIp: string,
+): Promise<boolean> {
+  const ipHash = await hashToken(clientIp);
+  // 16 coordinator DO shards by IP hash to avoid single hot DO bottleneck
+  const shard = ipHash.slice(0, 1);
+  const rlStub = env.ROOMS.get(env.ROOMS.idFromName(`__RL_${shard}`));
+  const res = await rlStub.fetch(
+    makeInternalRequest('/internal/rate-limit', {
+      method: 'POST',
+      body: JSON.stringify({ key: ipHash, channel }),
+    }),
+  );
+  return res.status !== 429;
 }
 
 export async function createRoomViaService(
@@ -70,6 +94,11 @@ export async function createRoomViaService(
     );
 
     if (res.status === 409) {
+      const errBody = (await res.json().catch(() => null)) as { error?: { code?: string; message?: string } } | null;
+      const errCode = errBody?.error?.code as ProtocolError['code'] | undefined;
+      if (errCode && errCode !== 'ROOM_ALREADY_EXISTS') {
+        throw new ProtocolError(errCode, errBody?.error?.message, 409);
+      }
       if (idemStub && keyHash && claimed) {
         await idemStub.fetch(
           makeInternalRequest('/internal/idem-release', {
@@ -101,6 +130,7 @@ export async function joinRoomViaService(
   env: Env,
   rawCode: string,
   input: JoinRoomHttpRequest,
+  clientIp?: string,
 ): Promise<Response> {
   const roomCode = normalizeRoomCode(rawCode);
   if (!isValidRoomCode(roomCode)) {
@@ -116,6 +146,7 @@ export async function joinRoomViaService(
   return stub.fetch(
     makeInternalRequest('/internal/join', {
       method: 'POST',
+      headers: clientIp ? { [CLIENT_IP_HEADER_NAME]: clientIp } : undefined,
       body: JSON.stringify({
         name: sanitizePlayerName(input.name, 'لاعب'),
         cosmetic: sanitizeCosmeticOrDefault(input.cosmetic, 1),
@@ -139,6 +170,7 @@ export async function forwardWebSocketToRoom(
   env: Env,
   rawCode: string,
   request: Request,
+  clientIp?: string,
 ): Promise<Response> {
   const roomCode = normalizeRoomCode(rawCode);
   if (!isValidRoomCode(roomCode)) {
@@ -152,6 +184,9 @@ export async function forwardWebSocketToRoom(
   const stub = env.ROOMS.get(env.ROOMS.idFromName(roomCode));
   const internalHeaders = new Headers(request.headers);
   internalHeaders.set(INTERNAL_HEADER_NAME, INTERNAL_HEADER_VALUE);
+  if (clientIp) {
+    internalHeaders.set(CLIENT_IP_HEADER_NAME, clientIp);
+  }
 
   return stub.fetch(
     new Request('https://raft-room.internal/internal/ws', {

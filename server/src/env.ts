@@ -1,11 +1,17 @@
+export interface RateLimitBinding {
+  limit(options: { key: string }): Promise<{ success: boolean }>;
+}
+
 export interface Env {
   ROOMS: DurableObjectNamespace;
+  RATE_LIMITER?: RateLimitBinding;
   ENVIRONMENT?: string;
   ALLOWED_ORIGINS?: string;
 }
 
 export const INTERNAL_HEADER_NAME = 'x-raft-internal';
 export const INTERNAL_HEADER_VALUE = 'worker-router-v1';
+export const CLIENT_IP_HEADER_NAME = 'x-raft-client-ip';
 
 export function parseAllowedOrigins(env: Env): string[] | null {
   if (!env.ALLOWED_ORIGINS || env.ALLOWED_ORIGINS.trim().length === 0) {
@@ -21,6 +27,10 @@ export function isOriginAllowed(request: Request, env: Env, requireOriginHeader 
   const allowed = parseAllowedOrigins(env);
   const origin = request.headers.get('origin');
   if (!allowed) {
+    // Fail closed in production when ALLOWED_ORIGINS is omitted
+    if (env.ENVIRONMENT === 'production') {
+      return false;
+    }
     return true;
   }
   if (!origin) {
@@ -33,6 +43,9 @@ export function resolveCorsAllowOrigin(request: Request, env: Env): string | nul
   const allowed = parseAllowedOrigins(env);
   const origin = request.headers.get('origin');
   if (!allowed) {
+    if (env.ENVIRONMENT === 'production') {
+      return null;
+    }
     return origin ?? '*';
   }
   if (origin && allowed.includes(origin)) {

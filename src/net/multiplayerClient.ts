@@ -80,6 +80,9 @@ export class MultiplayerClient {
   private disposed = false;
   private reconnectAttempts = 0;
   private connectPromise: Promise<void> | null = null;
+  private pendingRoomRequest: Promise<void> | null = null;
+  private pendingRoomSignature: string | null = null;
+  private pendingIdempotency: { signature: string; key: string } | null = null;
 
   constructor(callbacks: MultiplayerCallbacks) {
     this.callbacks = callbacks;
@@ -425,64 +428,129 @@ export class MultiplayerClient {
     this.lastEventId = 0;
   }
 
-  public async createRoom(
+  private getOrCreateIdempotencyKey(signature: string, customKey?: string): string {
+    if (customKey) {
+      return customKey;
+    }
+    if (this.pendingIdempotency && this.pendingIdempotency.signature === signature) {
+      return this.pendingIdempotency.key;
+    }
+    const key =
+      typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    this.pendingIdempotency = { signature, key };
+    return key;
+  }
+
+  public createRoom(
     name: string,
     cosmetic: PlayerCosmetic,
     customIdempotencyKey?: string,
   ): Promise<void> {
-    this.terminateSessionAndCloseSocket('NEW_SESSION');
-    this.intentionalLeave = false;
-    this.reconnectAttempts = 0;
-    this.setStatus('connecting');
-
-    const idempotencyKey =
-      customIdempotencyKey ?? (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`);
-    const res = await fetch(`${getApiBaseUrl()}/api/v1/rooms`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name, cosmetic, idempotencyKey }),
-    });
-
-    if (!res.ok) {
-      this.setStatus('disconnected');
-      const errBody = (await res.json().catch(() => null)) as HttpErrorResponse | null;
-      throw new Error(errBody?.error?.message || 'تعذر إنشاء الغرفة');
+    const signature = `create:${name.trim()}:${JSON.stringify(cosmetic)}`;
+    if (this.pendingRoomRequest) {
+      if (this.pendingRoomSignature === signature) {
+        return this.pendingRoomRequest;
+      }
+      return Promise.reject(new Error('يوجد طلب اتصال قيد التنفيذ بالفعل، يرجى الانتظار.'));
     }
 
-    const creds = (await res.json()) as RoomSessionCredentials;
-    this.applyIssuedCredentials(creds);
-    await this.connect(creds.roomCode, false);
+    const idempotencyKey = this.getOrCreateIdempotencyKey(signature, customIdempotencyKey);
+    this.pendingRoomSignature = signature;
+
+    const op = (async () => {
+      this.terminateSessionAndCloseSocket('NEW_SESSION');
+      this.intentionalLeave = false;
+      this.reconnectAttempts = 0;
+      this.setStatus('connecting');
+
+      const res = await fetch(`${getApiBaseUrl()}/api/v1/rooms`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name, cosmetic, idempotencyKey }),
+      });
+
+      if (!res.ok) {
+        this.setStatus('disconnected');
+        const errBody = (await res.json().catch(() => null)) as HttpErrorResponse | null;
+        if (errBody?.error?.code === 'SESSION_ALREADY_ACTIVE') {
+          this.pendingIdempotency = null;
+        }
+        throw new Error(errBody?.error?.message || 'تعذر إنشاء الغرفة');
+      }
+
+      const creds = (await res.json()) as RoomSessionCredentials;
+      this.applyIssuedCredentials(creds);
+      await this.connect(creds.roomCode, false);
+      this.pendingIdempotency = null;
+    })().finally(() => {
+      if (this.pendingRoomRequest === op) {
+        this.pendingRoomRequest = null;
+        this.pendingRoomSignature = null;
+      }
+    });
+
+    this.pendingRoomRequest = op;
+    return op;
   }
 
-  public async joinRoom(
+  public joinRoom(
     roomCode: string,
     name: string,
     cosmetic: PlayerCosmetic,
     customIdempotencyKey?: string,
   ): Promise<void> {
-    this.terminateSessionAndCloseSocket('NEW_SESSION');
-    this.intentionalLeave = false;
-    this.reconnectAttempts = 0;
-    this.setStatus('connecting');
-
     const normalizedCode = roomCode.trim().toUpperCase();
-    const idempotencyKey =
-      customIdempotencyKey ?? (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`);
-    const res = await fetch(`${getApiBaseUrl()}/api/v1/rooms/${encodeURIComponent(normalizedCode)}/join`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name, cosmetic, idempotencyKey }),
-    });
-
-    if (!res.ok) {
-      this.setStatus('disconnected');
-      const errBody = (await res.json().catch(() => null)) as HttpErrorResponse | null;
-      throw new Error(errBody?.error?.message || 'تعذر الانضمام للغرفة');
+    if (!/^[A-Z0-9]{6,10}$/.test(normalizedCode)) {
+      return Promise.reject(new Error('رمز الغرفة يجب أن يتكون من 6 إلى 10 أحرف أو أرقام.'));
     }
 
-    const creds = (await res.json()) as RoomSessionCredentials;
-    this.applyIssuedCredentials(creds);
-    await this.connect(creds.roomCode, false);
+    const signature = `join:${normalizedCode}:${name.trim()}:${JSON.stringify(cosmetic)}`;
+    if (this.pendingRoomRequest) {
+      if (this.pendingRoomSignature === signature) {
+        return this.pendingRoomRequest;
+      }
+      return Promise.reject(new Error('يوجد طلب اتصال قيد التنفيذ بالفعل، يرجى الانتظار.'));
+    }
+
+    const idempotencyKey = this.getOrCreateIdempotencyKey(signature, customIdempotencyKey);
+    this.pendingRoomSignature = signature;
+
+    const op = (async () => {
+      this.terminateSessionAndCloseSocket('NEW_SESSION');
+      this.intentionalLeave = false;
+      this.reconnectAttempts = 0;
+      this.setStatus('connecting');
+
+      const res = await fetch(`${getApiBaseUrl()}/api/v1/rooms/${encodeURIComponent(normalizedCode)}/join`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name, cosmetic, idempotencyKey }),
+      });
+
+      if (!res.ok) {
+        this.setStatus('disconnected');
+        const errBody = (await res.json().catch(() => null)) as HttpErrorResponse | null;
+        if (errBody?.error?.code === 'SESSION_ALREADY_ACTIVE') {
+          this.pendingIdempotency = null;
+        }
+        throw new Error(errBody?.error?.message || 'تعذر الانضمام للغرفة');
+      }
+
+      const creds = (await res.json()) as RoomSessionCredentials;
+      this.applyIssuedCredentials(creds);
+      await this.connect(creds.roomCode, false);
+      this.pendingIdempotency = null;
+    })().finally(() => {
+      if (this.pendingRoomRequest === op) {
+        this.pendingRoomRequest = null;
+        this.pendingRoomSignature = null;
+      }
+    });
+
+    this.pendingRoomRequest = op;
+    return op;
   }
 
   public setReady(ready: boolean): void {
@@ -529,6 +597,7 @@ export class MultiplayerClient {
 
   public leaveRoom(): void {
     this.intentionalLeave = true;
+    this.pendingIdempotency = null;
     this.clearReconnectTimer();
     this.clearPingTimer();
     this.clearInputKeepalive();
@@ -559,6 +628,9 @@ export class MultiplayerClient {
   public dispose(): void {
     this.disposed = true;
     this.intentionalLeave = true;
+    this.pendingIdempotency = null;
+    this.pendingRoomRequest = null;
+    this.pendingRoomSignature = null;
     this.clearReconnectTimer();
     this.clearPingTimer();
     this.clearInputKeepalive();

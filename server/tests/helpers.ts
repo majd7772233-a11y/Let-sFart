@@ -86,6 +86,6 @@ export async function connectAndAuthWs(
       payload: { playerId: creds.playerId, resumeToken: creds.resumeToken },
     }),
   );
-  await flush();
+  await flush(60);
   return { ws, msgs };
 }

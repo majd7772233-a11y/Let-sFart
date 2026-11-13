@@ -17,6 +17,7 @@ interface LobbyModalProps {
   roomSnapshot: RoomSnapshot | null;
   myPlayerId: string | null;
   connectionStatus: ConnectionStatus;
+  isSubmitting?: boolean;
   errorMsg: string | null;
   onCreateRoom: () => void;
   onJoinRoom: (code: string) => void;
@@ -55,6 +56,7 @@ export const LobbyModal: React.FC<LobbyModalProps> = ({
   roomSnapshot,
   myPlayerId,
   connectionStatus,
+  isSubmitting = false,
   errorMsg,
   onCreateRoom,
   onJoinRoom,
@@ -66,6 +68,10 @@ export const LobbyModal: React.FC<LobbyModalProps> = ({
 }) => {
   const [joinCode, setJoinCode] = useState('');
   const [copied, setCopied] = useState(false);
+
+  const normalizedJoinCode = joinCode.trim().toUpperCase();
+  const isJoinCodeValid = /^[A-Z0-9]{6,10}$/.test(normalizedJoinCode);
+  const isBusy = isSubmitting || connectionStatus === 'connecting';
 
   const isHost = roomSnapshot ? roomSnapshot.hostId === myPlayerId : false;
   const me = roomSnapshot?.sim.players.find((p) => p.id === myPlayerId);
@@ -133,7 +139,7 @@ export const LobbyModal: React.FC<LobbyModalProps> = ({
               maxLength={16}
               value={playerName}
               onChange={(e) => onChangeName(e.target.value)}
-              disabled={Boolean(roomSnapshot)}
+              disabled={Boolean(roomSnapshot) || isBusy}
               placeholder="اكتب اسمك..."
               className="w-full px-3 py-2 rounded-xl bg-[#19334d] border-2 border-[#39628a] text-white font-bold focus:outline-none focus:border-[#ffd13b] disabled:opacity-60"
             />
@@ -211,9 +217,11 @@ export const LobbyModal: React.FC<LobbyModalProps> = ({
               <button
                 type="button"
                 onClick={onCreateRoom}
-                className="wood-btn-primary w-full py-3 rounded-xl font-black text-base cursor-pointer"
+                disabled={isBusy}
+                aria-busy={isBusy}
+                className="wood-btn-primary w-full py-3 rounded-xl font-black text-base cursor-pointer disabled:opacity-55 disabled:cursor-not-allowed"
               >
-                أنشئ غرفة الآن
+                {isBusy ? 'جاري الإنشاء...' : 'أنشئ غرفة الآن'}
               </button>
             </div>
 
@@ -227,19 +235,31 @@ export const LobbyModal: React.FC<LobbyModalProps> = ({
                   type="text"
                   maxLength={10}
                   value={joinCode}
+                  disabled={isBusy}
                   onChange={(e) => setJoinCode(e.target.value.toUpperCase())}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && !isBusy && isJoinCodeValid) {
+                      onJoinRoom(normalizedJoinCode);
+                    }
+                  }}
                   placeholder="مثال: A4K9M2PX"
                   dir="ltr"
-                  className="mt-2 w-full px-3 py-2.5 rounded-xl bg-[#19334d] border-2 border-[#39628a] text-center text-lg tracking-widest font-black text-[#ffd13b] uppercase focus:outline-none focus:border-[#ffd13b]"
+                  className="mt-2 w-full px-3 py-2.5 rounded-xl bg-[#19334d] border-2 border-[#39628a] text-center text-lg tracking-widest font-black text-[#ffd13b] uppercase focus:outline-none focus:border-[#ffd13b] disabled:opacity-60"
                 />
+                {normalizedJoinCode.length > 0 && !isJoinCodeValid && (
+                  <p className="mt-1.5 text-[11px] font-bold text-[#ffd166]">
+                    يتكون رمز الغرفة من 6 إلى 10 أحرف أو أرقام إنجليزية.
+                  </p>
+                )}
               </div>
               <button
                 type="button"
-                onClick={() => onJoinRoom(joinCode)}
-                disabled={joinCode.trim().length < 2}
-                className="wood-btn-secondary w-full py-3 rounded-xl font-black text-base cursor-pointer disabled:opacity-50"
+                onClick={() => onJoinRoom(normalizedJoinCode)}
+                disabled={isBusy || !isJoinCodeValid}
+                aria-busy={isBusy}
+                className="wood-btn-secondary w-full py-3 rounded-xl font-black text-base cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                دخول الغرفة
+                {isBusy ? 'جاري الدخول...' : 'دخول الغرفة'}
               </button>
             </div>
           </div>

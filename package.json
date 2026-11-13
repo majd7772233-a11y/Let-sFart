@@ -14,7 +14,7 @@
     "test:physics": "tsx --test src/shared/physics.test.ts",
     "test:server": "vitest run --config server/vitest.config.ts",
     "test:node-server": "tsx --test server/src/tests/*.test.ts",
-    "test:all": "npm run test:physics && npm run test:server"
+    "test:all": "npm run test:physics && npm run test:server && npm run test:node-server"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
@@ -43,6 +43,7 @@
     "tailwindcss": "^4.3.3",
     "tsx": "^4.21.0",
     "typescript": "^7.0.2",
-    "vitest": "^5.1.0"
+    "vitest": "^5.1.0",
+    "wrangler": "^4"
   }
 }

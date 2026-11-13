@@ -1,10 +1,11 @@
 import { PROTOCOL_VERSION, type CreateRoomHttpRequest, type HealthResponse, type JoinRoomHttpRequest } from '../../src/shared/protocol.ts';
 import { isOriginAllowed, resolveCorsAllowOrigin, type Env } from './env.ts';
 import { logServerEvent } from './lib/logger.ts';
-import { extractClientIpKey, HttpIpRateLimiter } from './lib/rateLimit.ts';
+import { extractClientIpKey, HttpIpRateLimiter, type HttpRateChannel } from './lib/rateLimit.ts';
 import { isRecord, readBoundedJson } from './lib/validation.ts';
 import { makeErrorPayload, ProtocolError } from './protocol/errors.ts';
 import {
+  consumeDurableHttpRateLimit,
   createRoomViaService,
   forwardWebSocketToRoom,
   getRoomInfoViaService,
@@ -15,6 +16,19 @@ const httpRateLimiter = new HttpIpRateLimiter();
 
 export function clearHttpRateLimiter(): void {
   httpRateLimiter.clearAll();
+}
+
+async function checkEdgeRateLimit(env: Env, channel: HttpRateChannel, ipKey: string): Promise<boolean> {
+  if (!httpRateLimiter.consume(ipKey, channel)) {
+    return false;
+  }
+  if (env.RATE_LIMITER) {
+    const res = await env.RATE_LIMITER.limit({ key: `${channel}:${ipKey}` });
+    if (!res.success) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function withCors(res: Response, request: Request, env: Env): Response {
@@ -98,7 +112,10 @@ export async function routeWorkerRequest(request: Request, env: Env): Promise<Re
 
     // Create Room: POST /api/v1/rooms
     if (path === '/api/v1/rooms' && request.method === 'POST') {
-      if (!httpRateLimiter.consume(ipKey, 'create')) {
+      if (!(await checkEdgeRateLimit(env, 'create', ipKey))) {
+        return jsonResp({ error: makeErrorPayload('RATE_LIMITED') }, 429, request, env);
+      }
+      if (!env.RATE_LIMITER && !(await consumeDurableHttpRateLimit(env, 'create', ipKey))) {
         return jsonResp({ error: makeErrorPayload('RATE_LIMITED') }, 429, request, env);
       }
       const bodyResult = await readBoundedJson(request, 4096);
@@ -120,7 +137,7 @@ export async function routeWorkerRequest(request: Request, env: Env): Promise<Re
     // Join Room: POST /api/v1/rooms/:code/join
     const joinMatch = path.match(/^\/api\/v1\/rooms\/([^/]+)\/join$/);
     if (joinMatch && request.method === 'POST') {
-      if (!httpRateLimiter.consume(ipKey, 'join')) {
+      if (!(await checkEdgeRateLimit(env, 'join', ipKey))) {
         return jsonResp({ error: makeErrorPayload('RATE_LIMITED') }, 429, request, env);
       }
       const bodyResult = await readBoundedJson(request, 4096);
@@ -130,18 +147,23 @@ export async function routeWorkerRequest(request: Request, env: Env): Promise<Re
       const data = isRecord(bodyResult.data) ? bodyResult.data : {};
       const headerIdem = request.headers.get('idempotency-key') ?? undefined;
       const bodyIdem = typeof data.idempotencyKey === 'string' ? data.idempotencyKey : undefined;
-      const doRes = await joinRoomViaService(env, decodeURIComponent(joinMatch[1]), {
-        name: typeof data.name === 'string' ? data.name : '',
-        cosmetic: data.cosmetic as JoinRoomHttpRequest['cosmetic'],
-        idempotencyKey: bodyIdem ?? headerIdem,
-      });
+      const doRes = await joinRoomViaService(
+        env,
+        decodeURIComponent(joinMatch[1]),
+        {
+          name: typeof data.name === 'string' ? data.name : '',
+          cosmetic: data.cosmetic as JoinRoomHttpRequest['cosmetic'],
+          idempotencyKey: bodyIdem ?? headerIdem,
+        },
+        ipKey,
+      );
       return withCors(doRes, request, env);
     }
 
     // Room Public Info: GET /api/v1/rooms/:code
     const infoMatch = path.match(/^\/api\/v1\/rooms\/([^/]+)$/);
     if (infoMatch && request.method === 'GET') {
-      if (!httpRateLimiter.consume(ipKey, 'info')) {
+      if (!(await checkEdgeRateLimit(env, 'info', ipKey))) {
         return jsonResp({ error: makeErrorPayload('RATE_LIMITED') }, 429, request, env);
       }
       const doRes = await getRoomInfoViaService(env, decodeURIComponent(infoMatch[1]));
@@ -151,10 +173,10 @@ export async function routeWorkerRequest(request: Request, env: Env): Promise<Re
     // Room WebSocket: GET /ws/rooms/:code
     const wsMatch = path.match(/^\/ws\/rooms\/([^/]+)$/);
     if (wsMatch && request.method === 'GET') {
-      if (!httpRateLimiter.consume(ipKey, 'ws')) {
+      if (!(await checkEdgeRateLimit(env, 'ws', ipKey))) {
         return jsonResp({ error: makeErrorPayload('RATE_LIMITED') }, 429, request, env);
       }
-      return await forwardWebSocketToRoom(env, decodeURIComponent(wsMatch[1]), request);
+      return await forwardWebSocketToRoom(env, decodeURIComponent(wsMatch[1]), request, ipKey);
     }
 
     return jsonResp({ error: makeErrorPayload('ROOM_NOT_FOUND', 'المسار غير موجود.') }, 404, request, env);

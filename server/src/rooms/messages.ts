@@ -22,7 +22,12 @@ import type { RoomPersistence } from './persistence.ts';
 import type { SessionManager } from './sessions.ts';
 import { prepareSimForStart, restartRoomToWaiting } from './simulation.ts';
 import { getEventsSince, issueNextRoomSnapshot } from './snapshots.ts';
-import type { RoomRecord, SocketAttachment, SocketBinding } from './types.ts';
+import {
+  MAX_WS_AUTH_ATTEMPTS,
+  type RoomRecord,
+  type SocketAttachment,
+  type SocketBinding,
+} from './types.ts';
 
 export interface MessageDispatchContext {
   room: RoomRecord;
@@ -30,6 +35,13 @@ export interface MessageDispatchContext {
   sessions: SessionManager;
   persistence: RoomPersistence;
   rateLimiter: SessionRateLimiter;
+  consumeDurableRateLimit?: (
+    key: string,
+    capacity: number,
+    refillPerMs: number,
+    ttlMs?: number,
+    nowMs?: number,
+  ) => boolean;
   sendToSocket: (ws: WebSocket, msg: ServerProtocolMessage) => void;
   broadcastState: (requestId?: string) => void;
   closeSocket: (ws: WebSocket, code: number, reason: string) => void;
@@ -53,6 +65,20 @@ export async function handleRoomClientMessage(
       ctx.binding.ws,
       makeRoomErrorMsg(parsed.error.code, parsed.error.message, parsed.requestId, parsed.error.command),
     );
+    if (!ctx.binding.authenticated && parsed.error.command === 'session:authenticate') {
+      const nextAttempts = (ctx.binding.authAttempts ?? 0) + 1;
+      ctx.binding.authAttempts = nextAttempts;
+      ctx.updateAttachment?.(ctx.binding.ws, {
+        authenticated: false,
+        playerId: null,
+        sessionId: null,
+        connectionEpoch: 0,
+        authAttempts: nextAttempts,
+      });
+      if (nextAttempts >= MAX_WS_AUTH_ATTEMPTS) {
+        ctx.closeSocket(ctx.binding.ws, 4003, 'AUTH_FAILED_LIMIT');
+      }
+    }
     return;
   }
 
@@ -76,8 +102,54 @@ export async function handleRoomClientMessage(
   }
 
   if (msg.type === 'session:authenticate') {
+    const nextAttempts = (ctx.binding.authAttempts ?? 0) + 1;
+    ctx.binding.authAttempts = nextAttempts;
+    ctx.updateAttachment?.(ctx.binding.ws, {
+      authenticated: ctx.binding.authenticated,
+      playerId: ctx.binding.playerId,
+      sessionId: ctx.binding.sessionId,
+      connectionEpoch: ctx.binding.connectionEpoch,
+      authAttempts: nextAttempts,
+    });
+
+    if (nextAttempts > MAX_WS_AUTH_ATTEMPTS) {
+      logServerEvent('security_rejected', {
+        roomCode: ctx.room.roomCode,
+        command: 'session:authenticate',
+        code: 'RATE_LIMITED',
+      });
+      ctx.sendToSocket(
+        ctx.binding.ws,
+        makeRoomErrorMsg(
+          'RATE_LIMITED',
+          'تم تجاوز الحد المسموح لمحاولات المصادقة على هذا الاتصال.',
+          reqId,
+          'session:authenticate',
+        ),
+      );
+      ctx.closeSocket(ctx.binding.ws, 4003, 'AUTH_ATTEMPTS_EXCEEDED');
+      return;
+    }
+
+    const { playerId, resumeToken } = msg.payload!;
+    const durableAllowed = ctx.consumeDurableRateLimit
+      ? ctx.consumeDurableRateLimit(`rl:wsauth:${playerId}`, 10, 10 / 60_000, 5 * 60_000, nowMs)
+      : true;
+    if (!ctx.rateLimiter.consume(playerId, 'auth', nowMs) || !durableAllowed) {
+      logServerEvent('security_rejected', {
+        roomCode: ctx.room.roomCode,
+        command: 'session:authenticate',
+        code: 'RATE_LIMITED',
+      });
+      ctx.sendToSocket(
+        ctx.binding.ws,
+        makeRoomErrorMsg('RATE_LIMITED', undefined, reqId, 'session:authenticate'),
+      );
+      ctx.closeSocket(ctx.binding.ws, 4003, 'AUTH_RATE_LIMITED');
+      return;
+    }
+
     try {
-      const { playerId, resumeToken } = msg.payload!;
       const existing = ctx.room.sessions.get(playerId);
       const isReconnect = Boolean(existing && existing.connectionEpoch > 1);
 
@@ -95,11 +167,13 @@ export async function handleRoomClientMessage(
           playerId: null,
           sessionId: null,
           connectionEpoch: 0,
+          authAttempts: 0,
         };
         oldBinding.authenticated = false;
         oldBinding.playerId = null;
         oldBinding.sessionId = null;
         oldBinding.connectionEpoch = 0;
+        oldBinding.authAttempts = 0;
         ctx.updateAttachment?.(oldBinding.ws, cleared);
         ctx.sendToSocket(
           oldBinding.ws,
@@ -113,11 +187,13 @@ export async function handleRoomClientMessage(
       ctx.binding.playerId = session.playerId;
       ctx.binding.sessionId = session.sessionId;
       ctx.binding.connectionEpoch = session.connectionEpoch;
+      ctx.binding.authAttempts = 0;
       ctx.updateAttachment?.(ctx.binding.ws, {
         authenticated: true,
         playerId: session.playerId,
         sessionId: session.sessionId,
         connectionEpoch: session.connectionEpoch,
+        authAttempts: 0,
       });
 
       const simPlayer = ctx.room.sim.players[session.slot];
@@ -192,6 +268,9 @@ export async function handleRoomClientMessage(
         ctx.sendToSocket(ctx.binding.ws, makeRoomErrorMsg(err.code, err.message, reqId, 'session:authenticate'));
       } else {
         ctx.sendToSocket(ctx.binding.ws, makeRoomErrorMsg('INTERNAL_ERROR', undefined, reqId, 'session:authenticate'));
+      }
+      if ((ctx.binding.authAttempts ?? 0) >= MAX_WS_AUTH_ATTEMPTS) {
+        ctx.closeSocket(ctx.binding.ws, 4003, 'AUTH_FAILED_LIMIT');
       }
     }
     return;

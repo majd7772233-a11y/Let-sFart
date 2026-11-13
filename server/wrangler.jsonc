@@ -3,6 +3,11 @@
   "name": "letsfart-server",
   "main": "src/index.ts",
   "compatibility_date": "2026-03-01",
+  "workers_dev": true,
+  "vars": {
+    "ENVIRONMENT": "production",
+    "ALLOWED_ORIGINS": "https://ais-dev-zce24kq2crbvmocr3iivuz-527047456045.europe-west1.run.app,https://ais-pre-zce24kq2crbvmocr3iivuz-527047456045.europe-west1.run.app"
+  },
   "durable_objects": {
     "bindings": [
       {

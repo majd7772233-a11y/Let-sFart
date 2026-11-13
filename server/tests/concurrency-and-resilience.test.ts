@@ -184,6 +184,17 @@ describe('Concurrency, Atomicity, Durable Idempotency, Event Persistence & Clien
     const conn2 = await connectAndAuthWs(env, j2);
     expect(conn2.msgs.some((m) => m.type === 'room:joined' && m.payload?.playerId === j1.playerId)).toBe(true);
 
+    // Replaying join AFTER WS activation must fail explicitly with 409 SESSION_ALREADY_ACTIVE (no empty resumeToken)
+    const j2AfterActive = await joinRoomHttp(env, create1.roomCode, 'منضم', 'join-key-abc');
+    expect(j2AfterActive.status).toBe(409);
+    const j2ErrBody = (await j2AfterActive.json()) as { error?: { code?: string } };
+    expect(j2ErrBody.error?.code).toBe('SESSION_ALREADY_ACTIVE');
+
+    // Same for host create replay once host connects via WS
+    const conn1 = await connectAndAuthWs(env, create2);
+    expect(conn1.msgs.some((m) => m.type === 'room:joined' && m.payload?.playerId === create1.playerId)).toBe(true);
+    await expect(createRoomHttp(env, 'مضيف_ثابت', 'create-key-999')).rejects.toThrow('409');
+
     // A different idempotencyKey gets the next open slot (slot 2)
     const j3Res = await joinRoomHttp(env, create1.roomCode, 'منضم_ثان', 'join-key-def');
     expect(j3Res.status).toBe(200);

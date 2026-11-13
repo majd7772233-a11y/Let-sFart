@@ -9,6 +9,7 @@ export const ERROR_MESSAGES_AR: Record<ProtocolErrorCode, string> = {
   UNAUTHORIZED: 'يجب مصادقة الجلسة أولاً.',
   SESSION_EXPIRED: 'انتهت صلاحية الجلسة أو تم إبطالها.',
   SESSION_REPLACED: 'تم استبدال الجلسة باتصال جديد.',
+  SESSION_ALREADY_ACTIVE: 'تم تفعيل هذه الجلسة بالفعل ولا يمكن إعادة إصدار رمزها عبر هذا الطلب.',
   FORBIDDEN_HOST_ONLY: 'هذا الإجراء مسموح للمضيف فقط.',
   ROOM_NOT_FOUND: 'الغرفة غير موجودة أو انتهت صلاحيتها.',
   ROOM_CLOSED: 'الغرفة مغلقة ولا يمكن الانضمام إليها.',

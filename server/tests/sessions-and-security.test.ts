@@ -216,4 +216,119 @@ describe('SRV-21: Sessions, reconnect epoch safety, WS validation, and security 
     }
     expect(hit429).toBe(true);
   });
+
+  it('bounds WebSocket session:authenticate failures and closes the socket across DO hibernation', async () => {
+    const { env, namespace } = setupTestEnv();
+    disposeEnv = () => namespace.disposeAll();
+
+    const hostCreds = await createRoomHttp(env, 'حماية_مصادقة');
+    const wsRes = await routeWorkerRequest(
+      new Request(`http://localhost/ws/rooms/${hostCreds.roomCode}`, {
+        headers: { upgrade: 'websocket', origin: 'http://localhost:3000' },
+      }),
+      env,
+    );
+    const ws = extractLocalWsUpgrade(wsRes)!.webSocket as unknown as LocalWebSocket;
+    const msgs = collectMessages(ws);
+
+    const badAuth = JSON.stringify({
+      version: PROTOCOL_VERSION,
+      requestId: 'bad-auth',
+      type: 'session:authenticate',
+      payload: { playerId: hostCreds.playerId, resumeToken: 'wrong-token-000000' },
+    });
+
+    // Attempts 1 & 2 -> error returned, socket remains open
+    ws.send(badAuth);
+    ws.send(badAuth);
+    await flush();
+    expect(msgs.filter((m) => m.type === 'room:error' && m.payload?.code === 'UNAUTHORIZED')).toHaveLength(2);
+    expect(ws.readyState).toBe(1);
+
+    // Simulate DO hibernation eviction between auth failures -> attempt count survives in attachment!
+    namespace.simulateDormantWakeUp(hostCreds.roomCode);
+    await flush();
+
+    // Attempt 3 -> returns UNAUTHORIZED and immediately closes socket (MAX_WS_AUTH_ATTEMPTS = 3)
+    ws.send(badAuth);
+    await flush();
+    expect(msgs.filter((m) => m.type === 'room:error' && m.payload?.code === 'UNAUTHORIZED')).toHaveLength(3);
+    expect(ws.readyState).toBe(3);
+  });
+
+  it('enforces durable DO rate limiting across Worker isolate clears, supports RATE_LIMITER binding, and fails closed in production CORS', async () => {
+    const { env, namespace } = setupTestEnv();
+    disposeEnv = () => namespace.disposeAll();
+
+    // Production with unset ALLOWED_ORIGINS MUST reject requests and omit CORS * header
+    env.ENVIRONMENT = 'production';
+    env.ALLOWED_ORIGINS = '';
+    const unconfiguredProdRes = await routeWorkerRequest(
+      new Request('http://localhost/api/v1/rooms', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', origin: 'https://any.example.com' },
+        body: JSON.stringify({ name: 'test' }),
+      }),
+      env,
+    );
+    expect(unconfiguredProdRes.status).toBe(403);
+    expect(unconfiguredProdRes.headers.get('access-control-allow-origin')).toBeNull();
+
+    // Configure allowed origin for production
+    env.ALLOWED_ORIGINS = 'https://prod.example.com';
+
+    // Exhaust 12 create tokens in both Worker isolate and durable DO SQLite for IP 203.0.113.88
+    for (let i = 0; i < 12; i++) {
+      const res = await routeWorkerRequest(
+        new Request('http://localhost/api/v1/rooms', {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            origin: 'https://prod.example.com',
+            'cf-connecting-ip': '203.0.113.88',
+          },
+          body: JSON.stringify({ name: `d${i}` }),
+        }),
+        env,
+      );
+      expect(res.status).toBe(201);
+    }
+
+    // Clear Worker in-memory limiter (simulates isolate cold start/eviction)
+    const { clearHttpRateLimiter } = await import('../src/router.ts');
+    clearHttpRateLimiter();
+
+    // 13th request STILL blocked 429 by durable DO SQLite bucket!
+    const afterIsolateReset = await routeWorkerRequest(
+      new Request('http://localhost/api/v1/rooms', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          origin: 'https://prod.example.com',
+          'cf-connecting-ip': '203.0.113.88',
+        },
+        body: JSON.stringify({ name: 'blocked' }),
+      }),
+      env,
+    );
+    expect(afterIsolateReset.status).toBe(429);
+
+    // Optional Cloudflare RATE_LIMITER binding is honored when present
+    env.RATE_LIMITER = {
+      limit: async () => ({ success: false }),
+    };
+    const cfLimitedRes = await routeWorkerRequest(
+      new Request('http://localhost/api/v1/rooms', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          origin: 'https://prod.example.com',
+          'cf-connecting-ip': '198.51.100.9',
+        },
+        body: JSON.stringify({ name: 'edge' }),
+      }),
+      env,
+    );
+    expect(cfLimitedRes.status).toBe(429);
+  });
 });

@@ -101,4 +101,125 @@ describe('MultiplayerClient terminal auth error recovery', () => {
 
     client.dispose();
   });
+
+  it('locks duplicate in-flight create/join calls and reuses idempotencyKey across failed retries', async () => {
+    class InstantWebSocket {
+      static CONNECTING = 0;
+      static OPEN = 1;
+      static CLOSING = 2;
+      static CLOSED = 3;
+      public readyState = 1;
+      public onopen: (() => void) | null = null;
+      public onmessage: ((ev: { data: string }) => void) | null = null;
+      public onerror: (() => void) | null = null;
+      public onclose: (() => void) | null = null;
+      constructor(_url: string) {
+        queueMicrotask(() => {
+          if (this.readyState === 1) this.onopen?.();
+        });
+      }
+      send() {}
+      close() {
+        this.readyState = 3;
+      }
+    }
+
+    const fetchCalls: Array<{ url: string; body: { idempotencyKey?: string } }> = [];
+    let shouldFailCreate = true;
+    const delayedFetchHolder: { resolve?: () => void } = {};
+
+    const g = globalThis as unknown as {
+      window?: unknown;
+      WebSocket?: unknown;
+      fetch?: unknown;
+    };
+    const prevWindow = g.window;
+    const prevWs = g.WebSocket;
+    const prevFetch = g.fetch;
+
+    g.window = {
+      location: { protocol: 'http:', host: 'localhost:3000' },
+      setInterval: globalThis.setInterval.bind(globalThis),
+      clearInterval: globalThis.clearInterval.bind(globalThis),
+      setTimeout: globalThis.setTimeout.bind(globalThis),
+      clearTimeout: globalThis.clearTimeout.bind(globalThis),
+    };
+    g.WebSocket = InstantWebSocket;
+    g.fetch = async (url: string, init?: { body?: string }) => {
+      const parsed = JSON.parse(String(init?.body ?? '{}')) as { idempotencyKey?: string };
+      fetchCalls.push({ url: String(url), body: parsed });
+
+      if (shouldFailCreate) {
+        await new Promise<void>((r) => {
+          delayedFetchHolder.resolve = r;
+        });
+        return {
+          ok: false,
+          status: 503,
+          json: async () => ({ error: { code: 'INTERNAL_ERROR', message: 'عطل مؤقت' } }),
+        };
+      }
+
+      return {
+        ok: true,
+        status: 201,
+        json: async () => ({
+          roomCode: 'ABCD2345',
+          playerId: 'p-1',
+          resumeToken: 'rt-1',
+          sessionId: 's-1',
+          connectionEpoch: 1,
+          role: 'HOST',
+          slot: 0,
+          snapshot: {},
+        }),
+      };
+    };
+
+    restoreGlobals = () => {
+      g.window = prevWindow;
+      g.WebSocket = prevWs;
+      g.fetch = prevFetch;
+    };
+
+    const client = new MultiplayerClient({
+      onJoined: () => {},
+      onState: () => {},
+      onError: () => {},
+      onConnectionChange: () => {},
+    });
+
+    const cosmetic = { hat: 'none' as const, glasses: 'none' as const, colorIndex: 0 };
+
+    // 1. Short room code is rejected client-side without touching fetch
+    await expect(client.joinRoom('A', 'لاعب', cosmetic)).rejects.toThrow();
+    expect(fetchCalls).toHaveLength(0);
+
+    // 2. Concurrent identical createRoom clicks share ONE HTTP call, while conflicting join rejects
+    const p1 = client.createRoom('مضيف', cosmetic);
+    const p2 = client.createRoom('مضيف', cosmetic);
+    await expect(client.joinRoom('ABCD2345', 'مضيف', cosmetic)).rejects.toThrow();
+    expect(fetchCalls).toHaveLength(1);
+
+    delayedFetchHolder.resolve?.();
+    await expect(p1).rejects.toThrow('عطل مؤقت');
+    await expect(p2).rejects.toThrow('عطل مؤقت');
+
+    const firstKey = fetchCalls[0].body.idempotencyKey;
+    expect(typeof firstKey).toBe('string');
+    expect(firstKey!.length).toBeGreaterThan(5);
+
+    // 3. Retrying after failure reuses the EXACT same idempotencyKey
+    shouldFailCreate = false;
+    await client.createRoom('مضيف', cosmetic);
+    expect(fetchCalls).toHaveLength(2);
+    expect(fetchCalls[1].body.idempotencyKey).toBe(firstKey);
+
+    // 4. Subsequent new createRoom after success gets a fresh idempotencyKey
+    await client.createRoom('مضيف', cosmetic);
+    expect(fetchCalls).toHaveLength(3);
+    expect(fetchCalls[2].body.idempotencyKey).not.toBe(firstKey);
+
+    client.dispose();
+  });
 });
