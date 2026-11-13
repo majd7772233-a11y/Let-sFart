@@ -30,6 +30,14 @@ export function clamp(v: number, min: number, max: number): number {
   return v < min ? min : v > max ? max : v;
 }
 
+function pushEvent(state: WorldSimulationState, ev: Omit<SimEvent, 'id'>): void {
+  state.eventSeq += 1;
+  state.events.push({
+    id: state.eventSeq,
+    ...ev,
+  });
+}
+
 /**
  * Gradual fart intensity curve: F(t) / F_max = g(t / T)
  * Starts immediately at 0.24 on press, increases smoothly to 1.0 at T, and stays at 1.0.
@@ -123,6 +131,7 @@ export function createInitialSimState(
     invulnTimer: 0,
     fallTimer: 0,
     hitstopTimer: 0,
+    eventSeq: 0,
     events: [],
   };
 }
@@ -268,6 +277,7 @@ export function stepSimulation(
   let weightBalanceX = 0;
   let activeCount = 0;
 
+  // Pass 1: update lateral positions and count total active crew BEFORE applying crewScale
   for (const p of state.players) {
     const zone = PLAYER_ZONES[p.slot];
 
@@ -283,12 +293,17 @@ export function stepSimulation(
       weightBalanceX += p.localX;
       activeCount++;
     }
+  }
 
-    // Gradual fart thrust
+  // Uniform crew scaling applied equally to all connected seats
+  const crewScale = activeCount > 0 ? Math.min(1.5, 2.2 / Math.max(1, activeCount * 0.62)) : 1;
+
+  // Pass 2: compute fart thrust & torque fairly across all slots
+  for (const p of state.players) {
     if (p.farting && p.connected) {
       if (p.fartHoldTime === 0) {
         p.stats.fartCount += 1;
-        state.events.push({
+        pushEvent(state, {
           type: 'fart_start',
           slot: p.slot,
           intensity: 0.25,
@@ -304,8 +319,6 @@ export function stepSimulation(
       p.fartPower = computeFartFactor(p.fartHoldTime);
       p.releaseBounce = 0;
 
-      // Scale per-player thrust slightly depending on active crew count so solo or 2-4p all feel snappy
-      const crewScale = activeCount > 0 ? Math.min(1.5, 2.2 / Math.max(1, activeCount * 0.62)) : 1;
       const force = FART_MAX_THRUST * p.fartPower * crewScale;
       totalThrust += force;
 
@@ -315,7 +328,7 @@ export function stepSimulation(
       p.stats.torqueImpulseSum += Math.abs(torque) * dt;
     } else {
       if (p.fartHoldTime > 0) {
-        state.events.push({
+        pushEvent(state, {
           type: 'fart_stop',
           slot: p.slot,
           intensity: p.fartPower,
@@ -404,7 +417,7 @@ export function stepSimulation(
           raft.vz += nz * 7.5;
           raft.omega += (nx > 0 ? -1 : 1) * 1.4;
           state.hitstopTimer = Math.max(state.hitstopTimer, 0.035);
-          state.events.push({
+          pushEvent(state, {
             type: 'bumper',
             intensity: clamp(Math.abs(vn) / 10 + 0.4, 0.3, 1),
             x: obs.x,
@@ -418,7 +431,7 @@ export function stepSimulation(
           for (const p of state.players) {
             if (p.farting) p.stats.wallImpactCount += 1;
           }
-          state.events.push({
+          pushEvent(state, {
             type: 'collision',
             intensity: impactStrength,
             x: obs.x,
@@ -451,7 +464,7 @@ export function stepSimulation(
         raft.vz -= 1.85 * vn * nz;
         raft.omega += (raft.x - gx) * 0.35;
         state.hitstopTimer = Math.max(state.hitstopTimer, 0.045);
-        state.events.push({
+        pushEvent(state, {
           type: 'collision',
           intensity: clamp(Math.abs(vn) / 10 + 0.35, 0.3, 1),
           x: closestX,
@@ -472,7 +485,7 @@ export function stepSimulation(
       state.phase = 'falling';
       state.fallTimer = 0.85;
       state.falls += 1;
-      state.events.push({
+      pushEvent(state, {
         type: 'fall',
         intensity: 1,
         x: raft.x,
@@ -489,7 +502,7 @@ export function stepSimulation(
       raft.vx = -raft.vx * 0.55;
       raft.omega -= sign * 0.45;
       if (impact > 0.25) {
-        state.events.push({
+        pushEvent(state, {
           type: 'collision',
           intensity: impact,
           x: raft.x,
@@ -505,13 +518,19 @@ export function stepSimulation(
     if (raft.vz > 0) raft.vz = -raft.vz * 0.4;
   }
 
-  // Checkpoint capture
+  // Checkpoint capture (must be inside radial zone or cross checkpoint gate within horizontal span)
   for (const cp of course.checkpoints) {
     if (cp.index > state.checkpointIndex) {
       const dist = Math.hypot(raft.x - cp.x, raft.z - cp.z);
-      if (dist <= cp.radius + RAFT_RADIUS || raft.z <= cp.z) {
+      const maxLateralSpan = cp.radius + RAFT_RADIUS;
+      const inRadialZone = dist <= maxLateralSpan;
+      const crossedGateSpan =
+        raft.z <= cp.z &&
+        raft.z >= cp.z - 12 &&
+        Math.abs(raft.x - cp.x) <= maxLateralSpan;
+      if (inRadialZone || crossedGateSpan) {
         state.checkpointIndex = cp.index;
-        state.events.push({
+        pushEvent(state, {
           type: 'checkpoint',
           intensity: 1,
           x: cp.x,
@@ -521,16 +540,16 @@ export function stepSimulation(
     }
   }
 
-  // Progress & Finish Line
+  // Progress & Finish Line (must cross finishZ within finishX +/- finishHalfWidth)
   state.progress = getCourseProgress(raft.z, course);
-  if (raft.z <= course.finishZ) {
+  if (raft.z <= course.finishZ && Math.abs(raft.x - course.finishX) <= course.finishHalfWidth) {
     state.phase = 'finished';
     state.progress = 1;
     for (const p of state.players) {
       p.farting = false;
       p.moveDir = 0;
     }
-    state.events.push({
+    pushEvent(state, {
       type: 'finish',
       intensity: 1,
       x: raft.x,

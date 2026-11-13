@@ -98,6 +98,10 @@ export class RaftSceneManager {
   private screenState: GameScreenState = 'title';
   private sim: WorldSimulationState;
   private serverTargetSim: WorldSimulationState | null = null;
+  private serverSimTime = 0;
+  private lastServerSnapshotAtMs = 0;
+  private hasSyncedOnlineSimTime = false;
+  private lastProcessedEventId = 0;
   private mySlot: 0 | 1 | 2 | 3 = 0;
   private reduceShake = false;
   private trauma = 0;
@@ -247,6 +251,8 @@ export class RaftSceneManager {
       this.sound.startMusic();
     }
     this.serverTargetSim = null;
+    this.hasSyncedOnlineSimTime = false;
+    this.lastProcessedEventId = 0;
     this.mySlot = 0;
     this.sim = createInitialSimState('solo', playerName, cosmetic);
     this.sim.phase = 'playing';
@@ -259,14 +265,31 @@ export class RaftSceneManager {
     this.sim.players[this.mySlot].cosmetic = { ...cosmetic };
   }
 
-  public setOnlineRoomState(snapshot: RoomSnapshot, mySlot: 0 | 1 | 2 | 3): void {
+  public setOnlineRoomState(snapshot: RoomSnapshot, mySlot: 0 | 1 | 2 | 3, isInitialJoin = false): void {
     this.mySlot = mySlot;
     this.serverTargetSim = snapshot.sim;
+    this.serverSimTime = snapshot.sim.simTime;
+    this.lastServerSnapshotAtMs = performance.now();
     this.sim.mode = 'online';
 
-    const prevCheckpoint = this.sim.checkpointIndex;
     const prevFalls = this.sim.falls;
     const prevPhase = this.sim.phase;
+
+    // Reset event cursor on initial join or host restart (when server eventSeq resets)
+    if (isInitialJoin || snapshot.sim.eventSeq < this.lastProcessedEventId) {
+      this.lastProcessedEventId = snapshot.sim.eventSeq;
+    }
+
+    // Sync simulation clock immediately on join/start/large drift so moving gates align with server
+    if (
+      isInitialJoin ||
+      !this.hasSyncedOnlineSimTime ||
+      (prevPhase === 'waiting' && snapshot.sim.phase === 'playing') ||
+      Math.abs(this.sim.simTime - snapshot.sim.simTime) > 0.25
+    ) {
+      this.sim.simTime = snapshot.sim.simTime;
+      this.hasSyncedOnlineSimTime = true;
+    }
 
     // Copy player states & meta directly
     for (let i = 0; i < 4; i++) {
@@ -293,18 +316,18 @@ export class RaftSceneManager {
     this.sim.invulnTimer = snapshot.sim.invulnTimer;
     this.sim.phase = snapshot.sim.phase;
 
-    // Snap immediately on respawn or start
+    // Snap raft immediately on join, respawn, start, or large reconnect jump
+    const raftJumpDist = Math.hypot(
+      snapshot.sim.raft.x - this.sim.raft.x,
+      snapshot.sim.raft.z - this.sim.raft.z,
+    );
     if (
+      isInitialJoin ||
       snapshot.sim.falls > prevFalls ||
-      (prevPhase === 'waiting' && snapshot.sim.phase === 'playing')
+      (prevPhase === 'waiting' && snapshot.sim.phase === 'playing') ||
+      raftJumpDist > 12
     ) {
       this.sim.raft = { ...snapshot.sim.raft };
-    }
-
-    if (snapshot.sim.checkpointIndex > prevCheckpoint) {
-      this.sound.playCheckpoint();
-      this.toastText = `تم حفظ النقطة ${snapshot.sim.checkpointIndex}!`;
-      this.toastTimer = 2.2;
     }
 
     if (snapshot.sim.events.length > 0) {
@@ -313,7 +336,7 @@ export class RaftSceneManager {
 
     if (snapshot.sim.phase === 'finished' && prevPhase !== 'finished') {
       this.setScreenState('gameover');
-    } else if (snapshot.sim.phase === 'playing' && this.screenState === 'lobby') {
+    } else if (snapshot.sim.phase === 'playing' && (this.screenState === 'lobby' || isInitialJoin)) {
       this.sound.unlock();
       this.sound.startMusic();
       this.setScreenState('playing');
@@ -451,6 +474,9 @@ export class RaftSceneManager {
 
   private processSimEvents(events: SimEvent[]): void {
     for (const ev of events) {
+      if (ev.id <= this.lastProcessedEventId) continue;
+      this.lastProcessedEventId = ev.id;
+
       if (ev.type === 'collision') {
         this.sound.playCollision(ev.intensity);
         this.trauma = Math.min(1, this.trauma + ev.intensity * 0.5);
@@ -509,7 +535,11 @@ export class RaftSceneManager {
             (this.serverTargetSim.players[i].localX - this.sim.players[i].localX) * k;
           this.sim.players[i].lateralVel = this.serverTargetSim.players[i].lateralVel;
         }
+        // Advance simTime locally for 60fps smoothness while continuously phase-locking to server simTime
         this.sim.simTime += dt;
+        const elapsedSinceSnapshot = Math.min(0.15, Math.max(0, (nowMs - this.lastServerSnapshotAtMs) / 1000));
+        const targetServerSimTime = this.serverSimTime + elapsedSinceSnapshot;
+        this.sim.simTime += (targetServerSimTime - this.sim.simTime) * Math.min(1, 10 * dt);
       }
     } else if (this.screenState === 'title' || this.screenState === 'lobby') {
       // Gentle idle animation on title & lobby screen

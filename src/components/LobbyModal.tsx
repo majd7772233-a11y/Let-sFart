@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { CHARACTER_PRESETS, PLAYER_ZONES } from '../shared/course.ts';
-import type { GlassesStyle, HatStyle, PlayerCosmetic, RoomSnapshot } from '../shared/types.ts';
+import type { ConnectionStatus, GlassesStyle, HatStyle, PlayerCosmetic, RoomSnapshot } from '../shared/types.ts';
 
 interface LobbyModalProps {
   playerName: string;
@@ -9,6 +9,7 @@ interface LobbyModalProps {
   onChangeCosmetic: (c: PlayerCosmetic) => void;
   roomSnapshot: RoomSnapshot | null;
   myPlayerId: string | null;
+  connectionStatus: ConnectionStatus;
   errorMsg: string | null;
   onCreateRoom: () => void;
   onJoinRoom: (code: string) => void;
@@ -46,6 +47,7 @@ export const LobbyModal: React.FC<LobbyModalProps> = ({
   onChangeCosmetic,
   roomSnapshot,
   myPlayerId,
+  connectionStatus,
   errorMsg,
   onCreateRoom,
   onJoinRoom,
@@ -72,9 +74,31 @@ export const LobbyModal: React.FC<LobbyModalProps> = ({
     <div className="fixed inset-0 z-30 flex items-center justify-center p-4 bg-[#071928]/70">
       <div className="wood-panel w-full max-w-2xl rounded-3xl p-5 sm:p-6 text-[#fff8e7] max-h-[92vh] overflow-y-auto">
         <div className="flex items-center justify-between gap-3 border-b-2 border-[#f7d060]/30 pb-3 mb-4">
-          <h2 className="text-2xl font-black text-[#ffd13b] cartoon-outline-sm">
-            {roomSnapshot ? `غرفة اللعب: ${roomSnapshot.roomCode}` : 'اللعب الجماعي عبر الإنترنت'}
-          </h2>
+          <div className="flex items-center gap-2.5 flex-wrap">
+            <h2 className="text-2xl font-black text-[#ffd13b] cartoon-outline-sm">
+              {roomSnapshot ? `غرفة اللعب: ${roomSnapshot.roomCode}` : 'اللعب الجماعي عبر الإنترنت'}
+            </h2>
+            {(roomSnapshot || connectionStatus !== 'disconnected') && (
+              <span
+                data-testid="lobby-connection-status"
+                className={`px-2.5 py-0.5 rounded-lg text-xs font-black border ${
+                  connectionStatus === 'connected'
+                    ? 'bg-[#06d6a0]/20 text-[#06d6a0] border-[#06d6a0]/50'
+                    : connectionStatus === 'reconnecting' || connectionStatus === 'connecting'
+                      ? 'bg-[#ffd166]/20 text-[#ffd166] border-[#ffd166]/50'
+                      : 'bg-[#ff595e]/20 text-[#ff8589] border-[#ff595e]/50'
+                }`}
+              >
+                {connectionStatus === 'connected'
+                  ? 'متصل'
+                  : connectionStatus === 'reconnecting'
+                    ? 'جاري إعادة الاتصال...'
+                    : connectionStatus === 'connecting'
+                      ? 'جاري الاتصال...'
+                      : 'غير متصل'}
+              </span>
+            )}
+          </div>
           <button
             type="button"
             onClick={roomSnapshot ? onLeaveRoom : onClose}

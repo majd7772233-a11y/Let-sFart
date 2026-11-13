@@ -2,6 +2,8 @@ export type GameScreenState = 'title' | 'lobby' | 'playing' | 'paused' | 'gameov
 
 export type PlayMode = 'solo' | 'online';
 
+export type ConnectionStatus = 'disconnected' | 'connecting' | 'reconnecting' | 'connected';
+
 export type HatStyle = 'none' | 'captain' | 'crown' | 'propeller';
 export type GlassesStyle = 'none' | 'shades' | 'nerd';
 
@@ -64,6 +66,7 @@ export interface RaftSimState {
 export type SimPhase = 'waiting' | 'playing' | 'paused' | 'falling' | 'finished';
 
 export interface SimEvent {
+  id: number;
   type: 'collision' | 'bumper' | 'checkpoint' | 'fall' | 'finish' | 'fart_start' | 'fart_stop';
   slot?: number;
   intensity: number;
@@ -84,6 +87,7 @@ export interface WorldSimulationState {
   invulnTimer: number;
   fallTimer: number;
   hitstopTimer: number;
+  eventSeq: number;
   events: SimEvent[];
 }
 

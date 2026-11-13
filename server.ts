@@ -15,6 +15,7 @@ import type {
   PlayerCosmetic,
   RoomSnapshot,
   ServerToClientMessage,
+  SimEvent,
   WorldSimulationState,
 } from './src/shared/types.ts';
 
@@ -36,6 +37,7 @@ interface GameRoom {
   hostId: string;
   fillBots: boolean;
   sim: WorldSimulationState;
+  recentEvents: SimEvent[];
   conns: Map<string, ServerPlayerConn>;
   lastTickMs: number;
   lastBroadcastMs: number;
@@ -71,7 +73,10 @@ function makeRoomSnapshot(room: GameRoom): RoomSnapshot {
     roomCode: room.roomCode,
     hostId: room.hostId,
     fillBots: room.fillBots,
-    sim: room.sim,
+    sim: {
+      ...room.sim,
+      events: room.recentEvents.slice(),
+    },
   };
 }
 
@@ -131,6 +136,7 @@ function createRoom(hostWs: WebSocket, name: string, cosmetic: PlayerCosmetic): 
     hostId: playerId,
     fillBots: true,
     sim,
+    recentEvents: [],
     conns: new Map([
       [
         playerId,
@@ -361,15 +367,20 @@ async function startServer() {
           if (member.playerId === room.hostId) {
             room.sim.phase = 'playing';
             room.sim.elapsedTime = 0;
+            room.sim.simTime = 0;
             room.sim.falls = 0;
             room.sim.checkpointIndex = 0;
             room.sim.raft.x = 0;
+            room.sim.raft.y = 0;
             room.sim.raft.z = 0;
             room.sim.raft.vx = 0;
             room.sim.raft.vz = 0;
             room.sim.raft.yaw = 0;
             room.sim.raft.omega = 0;
             room.sim.progress = 0;
+            room.sim.eventSeq = 0;
+            room.sim.events = [];
+            room.recentEvents = [];
             broadcastRoomState(room);
           }
           break;
@@ -392,6 +403,7 @@ async function startServer() {
               };
             }
             room.sim = fresh;
+            room.recentEvents = [];
             syncBotsInRoom(room);
             broadcastRoomState(room);
           }
@@ -433,13 +445,21 @@ async function startServer() {
         enforceInputTimeouts(room.sim, now);
 
         // Bots in online rooms only run if fillBots is enabled
+        let stepEvents: SimEvent[];
         if (room.fillBots) {
           // Run simple bot assist for bot seats
           room.sim.mode = 'solo';
-          stepSimulation(room.sim, rawDt);
+          stepEvents = stepSimulation(room.sim, rawDt);
           room.sim.mode = 'online';
         } else {
-          stepSimulation(room.sim, rawDt);
+          stepEvents = stepSimulation(room.sim, rawDt);
+        }
+
+        if (stepEvents.length > 0) {
+          room.recentEvents.push(...stepEvents);
+          if (room.recentEvents.length > 32) {
+            room.recentEvents.splice(0, room.recentEvents.length - 32);
+          }
         }
       }
 

@@ -1,8 +1,10 @@
 import React from 'react';
 import type { HudSnapshot } from '../game/RaftSceneManager.ts';
+import type { ConnectionStatus } from '../shared/types.ts';
 
 interface GameHudProps {
   hud: HudSnapshot;
+  connectionStatus?: ConnectionStatus;
   muted: boolean;
   showTouchControls: boolean;
   powerFillRef: React.RefObject<HTMLDivElement | null>;
@@ -23,6 +25,7 @@ function formatTimer(sec: number): string {
 
 export const GameHud: React.FC<GameHudProps> = ({
   hud,
+  connectionStatus = 'disconnected',
   muted,
   showTouchControls,
   powerFillRef,
@@ -79,6 +82,29 @@ export const GameHud: React.FC<GameHudProps> = ({
             <span title="السقوط">💦 {hud.falls}</span>
             <span title="الطاقم">👥 {hud.connectedPlayers}/4</span>
           </div>
+          {hud.mode === 'online' && (
+            <div className="mt-1.5 pt-1.5 border-t border-[#2c4e70] flex items-center justify-between text-[11px] font-extrabold">
+              <span className="text-[#93c5fd]">حالة الاتصال</span>
+              <span
+                data-testid="hud-connection-status"
+                className={
+                  connectionStatus === 'connected'
+                    ? 'text-[#06d6a0]'
+                    : connectionStatus === 'reconnecting' || connectionStatus === 'connecting'
+                      ? 'text-[#ffd166]'
+                      : 'text-[#ff595e]'
+                }
+              >
+                {connectionStatus === 'connected'
+                  ? 'متصل'
+                  : connectionStatus === 'reconnecting'
+                    ? 'جاري إعادة الاتصال...'
+                    : connectionStatus === 'connecting'
+                      ? 'جاري الاتصال...'
+                      : 'انقطع الاتصال'}
+              </span>
+            </div>
+          )}
         </div>
 
         {/* Top-Left in RTL (End side): Compact Square SVG Utility Buttons */}
@@ -167,10 +193,14 @@ export const GameHud: React.FC<GameHudProps> = ({
         </div>
       </div>
 
-      {/* Transient Checkpoint / Fall Toast (Top-Center, zero center-playfield occlusion) */}
-      {hud.toastText && (
+      {/* Transient Checkpoint / Fall Toast or Reconnect Alert (Top-Center, zero center-playfield occlusion) */}
+      {(hud.toastText || (hud.mode === 'online' && connectionStatus === 'reconnecting')) && (
         <div className="fixed top-4 left-1/2 -translate-x-1/2 z-20 bg-[#12263a]/95 border-2 border-[#ffd13b] px-5 py-2 rounded-2xl shadow-xl whitespace-nowrap">
-          <span className="text-sm sm:text-base font-black text-[#ffd13b]">{hud.toastText}</span>
+          <span className="text-sm sm:text-base font-black text-[#ffd13b]">
+            {hud.mode === 'online' && connectionStatus === 'reconnecting'
+              ? 'جاري إعادة الاتصال بالغرفة تلقائياً...'
+              : hud.toastText}
+          </span>
         </div>
       )}
 

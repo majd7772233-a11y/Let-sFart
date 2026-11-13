@@ -3,9 +3,11 @@ interface ActiveFartVoice {
   subOsc: OscillatorNode;
   lfo: OscillatorNode;
   lfoGain: GainNode;
+  noise?: AudioBufferSourceNode;
   noiseGain: GainNode;
   masterGain: GainNode;
   filter: BiquadFilterNode;
+  stopTimer?: number;
 }
 
 export class SoundEngine {
@@ -137,8 +139,9 @@ export class SoundEngine {
       osc.connect(filter);
       subOsc.connect(filter);
 
+      let noise: AudioBufferSourceNode | undefined;
       if (this.noiseBuffer) {
-        const noise = ctx.createBufferSource();
+        noise = ctx.createBufferSource();
         noise.buffer = this.noiseBuffer;
         noise.loop = true;
         noiseGain.gain.setValueAtTime(0.08, now);
@@ -154,7 +157,7 @@ export class SoundEngine {
       subOsc.start(now);
       lfo.start(now);
 
-      voice = { osc, subOsc, lfo, lfoGain, noiseGain, masterGain, filter };
+      voice = { osc, subOsc, lfo, lfoGain, noise, noiseGain, masterGain, filter };
       this.fartVoices.set(slot, voice);
     }
 
@@ -169,30 +172,67 @@ export class SoundEngine {
     voice.masterGain.gain.setTargetAtTime(0.12 + power * 0.2, now, 0.04);
   }
 
-  public stopFartVoice(slot: number): void {
+  private cleanupVoiceNodes(voice: ActiveFartVoice): void {
+    const safeStop = (node?: AudioScheduledSourceNode) => {
+      if (!node) return;
+      try {
+        node.stop();
+      } catch {
+        // already stopped
+      }
+    };
+    const safeDisconnect = (node?: AudioNode) => {
+      if (!node) return;
+      try {
+        node.disconnect();
+      } catch {
+        // already disconnected
+      }
+    };
+
+    safeStop(voice.osc);
+    safeStop(voice.subOsc);
+    safeStop(voice.lfo);
+    safeStop(voice.noise);
+
+    safeDisconnect(voice.osc);
+    safeDisconnect(voice.subOsc);
+    safeDisconnect(voice.lfo);
+    safeDisconnect(voice.lfoGain);
+    safeDisconnect(voice.noise);
+    safeDisconnect(voice.noiseGain);
+    safeDisconnect(voice.filter);
+    safeDisconnect(voice.masterGain);
+  }
+
+  public stopFartVoice(slot: number, immediate = false): void {
     const voice = this.fartVoices.get(slot);
-    if (!voice || !this.ctx) return;
+    if (!voice) return;
     this.fartVoices.delete(slot);
+
+    if (voice.stopTimer !== undefined) {
+      window.clearTimeout(voice.stopTimer);
+      voice.stopTimer = undefined;
+    }
+
+    if (immediate || !this.ctx) {
+      this.cleanupVoiceNodes(voice);
+      return;
+    }
 
     const now = this.ctx.currentTime;
     // Play natural comic release tail rather than abrupt cutoff
     voice.osc.frequency.setTargetAtTime(34, now, 0.04);
     voice.masterGain.gain.setTargetAtTime(0.0001, now, 0.045);
-    window.setTimeout(() => {
-      try {
-        voice.osc.stop();
-        voice.subOsc.stop();
-        voice.lfo.stop();
-        voice.masterGain.disconnect();
-      } catch {
-        // already stopped
-      }
+    voice.stopTimer = window.setTimeout(() => {
+      voice.stopTimer = undefined;
+      this.cleanupVoiceNodes(voice);
     }, 160);
   }
 
-  public stopAllFarts(): void {
+  public stopAllFarts(immediate = false): void {
     for (const slot of Array.from(this.fartVoices.keys())) {
-      this.stopFartVoice(slot);
+      this.stopFartVoice(slot, immediate);
     }
   }
 
@@ -351,7 +391,7 @@ export class SoundEngine {
   }
 
   public dispose(): void {
-    this.stopAllFarts();
+    this.stopAllFarts(true);
     this.stopMusic();
     if (this.ctx) {
       this.ctx.close().catch(() => {});

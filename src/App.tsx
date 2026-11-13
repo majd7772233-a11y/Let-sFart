@@ -8,7 +8,7 @@ import { VictoryModal } from './components/VictoryModal.tsx';
 import { RaftSceneManager, type HudSnapshot } from './game/RaftSceneManager.ts';
 import { MultiplayerClient } from './net/multiplayerClient.ts';
 import { createDefaultCosmetic, createInitialSimState } from './shared/physics.ts';
-import type { GameScreenState, PlayerCosmetic, RoomSnapshot } from './shared/types.ts';
+import type { ConnectionStatus, GameScreenState, PlayerCosmetic, RoomSnapshot } from './shared/types.ts';
 
 export default function App() {
   const canvasMountRef = useRef<HTMLDivElement | null>(null);
@@ -29,6 +29,7 @@ export default function App() {
   const [myPlayerId, setMyPlayerId] = useState<string | null>(null);
   const [mySlot, setMySlot] = useState<0 | 1 | 2 | 3>(0);
   const [lobbyError, setLobbyError] = useState<string | null>(null);
+  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('disconnected');
 
   const [sfxVolume, setSfxVolume] = useState(0.8);
   const [musicVolume, setMusicVolume] = useState(0.35);
@@ -128,16 +129,18 @@ export default function App() {
         setMyPlayerId(playerId);
         setMySlot(slot);
         setRoomSnapshot(snapshot);
-        sceneRef.current?.setOnlineRoomState(snapshot, slot);
+        sceneRef.current?.setOnlineRoomState(snapshot, slot, true);
       },
       onState: (snapshot) => {
         setRoomSnapshot(snapshot);
-        sceneRef.current?.setOnlineRoomState(snapshot, mySlotRef.current);
+        sceneRef.current?.setOnlineRoomState(snapshot, mySlotRef.current, false);
       },
       onError: (msg) => {
         setLobbyError(msg);
       },
-      onConnectionChange: () => {},
+      onConnectionChange: (status) => {
+        setConnectionStatus(status);
+      },
     });
     netRef.current = net;
 
@@ -296,6 +299,7 @@ export default function App() {
           onChangeCosmetic={handleChangeCosmetic}
           roomSnapshot={roomSnapshot}
           myPlayerId={myPlayerId}
+          connectionStatus={connectionStatus}
           errorMsg={lobbyError}
           onCreateRoom={() => {
             setLobbyError(null);
@@ -328,6 +332,7 @@ export default function App() {
       {(screen === 'playing' || screen === 'paused') && (
         <GameHud
           hud={hud}
+          connectionStatus={connectionStatus}
           muted={sfxMuted && musicMuted}
           showTouchControls={showTouchControls}
           powerFillRef={powerFillRef}

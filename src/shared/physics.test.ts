@@ -98,11 +98,75 @@ test('checkpoint capture and fall-out respawn resets raft safely with zero veloc
   assert.ok(sim.invulnTimer > 1.0);
 });
 
-test('crossing finish line completes the run', () => {
-  const sim = createInitialSimState('online');
-  sim.raft.z = COURSE_MAIN.finishZ - 0.5;
-  const events = stepSimulation(sim, 0.05);
-  assert.equal(sim.phase, 'finished');
-  assert.equal(sim.progress, 1);
+test('crossing finish line completes the run only within finishX +/- finishHalfWidth', () => {
+  const simOut = createInitialSimState('online');
+  simOut.raft.z = COURSE_MAIN.finishZ - 0.5;
+  simOut.raft.x = COURSE_MAIN.finishX + COURSE_MAIN.finishHalfWidth + 4.0;
+  const outEvents = stepSimulation(simOut, 0.05);
+  assert.equal(simOut.phase, 'playing');
+  assert.equal(outEvents.some((e) => e.type === 'finish'), false);
+
+  const simIn = createInitialSimState('online');
+  simIn.raft.z = COURSE_MAIN.finishZ - 0.5;
+  simIn.raft.x = COURSE_MAIN.finishX;
+  const events = stepSimulation(simIn, 0.05);
+  assert.equal(simIn.phase, 'finished');
+  assert.equal(simIn.progress, 1);
   assert.ok(events.some((e) => e.type === 'finish'));
+});
+
+test('checkpoints require horizontal X proximity rather than Z-only crossing', () => {
+  const sim = createInitialSimState('online');
+  const cp1 = COURSE_MAIN.checkpoints[1];
+
+  // Crossing cp1.z far to the side should NOT capture checkpoint 1
+  sim.raft.z = cp1.z - 0.5;
+  sim.raft.x = cp1.x + cp1.radius + 10;
+  const missEvents = stepSimulation(sim, 0.05);
+  assert.equal(sim.checkpointIndex, 0);
+  assert.equal(missEvents.some((e) => e.type === 'checkpoint'), false);
+
+  // Crossing within horizontal checkpoint bounds SHOULD capture checkpoint 1
+  sim.raft.x = cp1.x + 1.5;
+  sim.raft.z = cp1.z - 0.5;
+  const hitEvents = stepSimulation(sim, 0.05);
+  assert.equal(sim.checkpointIndex, 1);
+  assert.ok(hitEvents.some((e) => e.type === 'checkpoint'));
+});
+
+test('crewScale thrust is identical across all 4 player slots when 4 players are connected', () => {
+  const measureSlotSpeed = (activeSlot: 0 | 1 | 2 | 3) => {
+    const sim = createInitialSimState('online');
+    for (let i = 0; i < 4; i++) {
+      sim.players[i].connected = true;
+      sim.players[i].isBot = false;
+      sim.players[i].localX = 0; // isolate forward thrust without lateral offset differences
+      sim.players[i].farting = i === activeSlot;
+    }
+    for (let step = 0; step < 10; step++) {
+      stepSimulation(sim, 0.05);
+    }
+    return -sim.raft.vz;
+  };
+
+  const s0 = measureSlotSpeed(0);
+  const s1 = measureSlotSpeed(1);
+  const s2 = measureSlotSpeed(2);
+  const s3 = measureSlotSpeed(3);
+
+  assert.ok(Math.abs(s0 - s1) < 1e-6 && Math.abs(s0 - s2) < 1e-6 && Math.abs(s0 - s3) < 1e-6);
+});
+
+test('SimEvents receive strictly monotonic sequential IDs across physics steps', () => {
+  const sim = createInitialSimState('online');
+  sim.players[0].connected = true;
+  sim.players[0].farting = true;
+  const e1 = stepSimulation(sim, 0.05);
+  sim.players[0].farting = false;
+  const e2 = stepSimulation(sim, 0.05);
+  const all = [...e1, ...e2];
+  assert.ok(all.length >= 2);
+  for (let i = 1; i < all.length; i++) {
+    assert.ok(all[i].id > all[i - 1].id);
+  }
 });
