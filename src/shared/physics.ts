@@ -158,9 +158,8 @@ export function updateBotInputs(state: WorldSimulationState, course: CourseDefin
   const yawError = desiredYaw - raft.yaw;
   const forwardSpeed = -raft.vx * Math.sin(raft.yaw) - raft.vz * Math.cos(raft.yaw);
 
-  // Check if human slot 0 is actively steering
-  const human = state.players[0];
-  const humanThrusting = human && !human.isBot && human.farting;
+  // Check if any human player is actively thrusting
+  const humanThrusting = state.players.some((p) => !p.isBot && p.connected && p.farting);
 
   for (const p of state.players) {
     if (!p.isBot || !p.connected) continue;
@@ -227,10 +226,15 @@ export function enforceInputTimeouts(state: WorldSimulationState, nowMs: number)
   }
 }
 
+export interface StepSimulationOptions {
+  enableBots?: boolean;
+}
+
 export function stepSimulation(
   state: WorldSimulationState,
   rawDt: number,
   course: CourseDefinition = COURSE_MAIN,
+  options?: StepSimulationOptions,
 ): SimEvent[] {
   const dt = clamp(rawDt, 0, 0.05);
   state.events = [];
@@ -264,7 +268,8 @@ export function stepSimulation(
     state.invulnTimer = Math.max(0, state.invulnTimer - dt);
   }
 
-  if (state.mode === 'solo') {
+  const shouldRunBots = options?.enableBots ?? state.mode === 'solo';
+  if (shouldRunBots) {
     updateBotInputs(state, course);
   }
 

@@ -165,10 +165,24 @@ export interface RoomPlayerMeta {
   cosmetic: PlayerCosmetic;
 }
 
+export type PlayerRole = 'HOST' | 'PLAYER';
+
+export type RoomLifecycleState =
+  | 'CREATING'
+  | 'WAITING'
+  | 'PLAYING'
+  | 'FALLING'
+  | 'FINISHED'
+  | 'RESTARTING'
+  | 'CLOSED';
+
 export interface RoomSnapshot {
   roomCode: string;
   hostId: string;
   fillBots: boolean;
+  lifecycleState?: RoomLifecycleState;
+  snapshotSeq: number;
+  serverTime: number;
   sim: WorldSimulationState;
 }
 

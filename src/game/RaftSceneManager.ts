@@ -102,6 +102,7 @@ export class RaftSceneManager {
   private lastServerSnapshotAtMs = 0;
   private hasSyncedOnlineSimTime = false;
   private lastProcessedEventId = 0;
+  private lastSnapshotSeq = 0;
   private mySlot: 0 | 1 | 2 | 3 = 0;
   private reduceShake = false;
   private trauma = 0;
@@ -266,6 +267,10 @@ export class RaftSceneManager {
   }
 
   public setOnlineRoomState(snapshot: RoomSnapshot, mySlot: 0 | 1 | 2 | 3, isInitialJoin = false): void {
+    if (!isInitialJoin && snapshot.snapshotSeq < this.lastSnapshotSeq) {
+      return;
+    }
+    this.lastSnapshotSeq = snapshot.snapshotSeq;
     this.mySlot = mySlot;
     this.serverTargetSim = snapshot.sim;
     this.serverSimTime = snapshot.sim.simTime;
@@ -340,6 +345,18 @@ export class RaftSceneManager {
       this.sound.unlock();
       this.sound.startMusic();
       this.setScreenState('playing');
+    } else if (
+      snapshot.sim.phase === 'waiting' &&
+      (this.screenState === 'gameover' || this.screenState === 'playing' || this.screenState === 'paused')
+    ) {
+      this.sound.stopAllFarts();
+      this.setScreenState('lobby');
+    }
+  }
+
+  public processDiscreteEvents(events: SimEvent[]): void {
+    if (events.length > 0) {
+      this.processSimEvents(events);
     }
   }
 

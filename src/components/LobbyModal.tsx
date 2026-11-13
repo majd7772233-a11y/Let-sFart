@@ -218,10 +218,10 @@ export const LobbyModal: React.FC<LobbyModalProps> = ({
                 <input
                   id="join-room-code"
                   type="text"
-                  maxLength={6}
+                  maxLength={10}
                   value={joinCode}
                   onChange={(e) => setJoinCode(e.target.value.toUpperCase())}
-                  placeholder="مثال: A4K9"
+                  placeholder="مثال: A4K9M2PX"
                   dir="ltr"
                   className="mt-2 w-full px-3 py-2.5 rounded-xl bg-[#19334d] border-2 border-[#39628a] text-center text-lg tracking-widest font-black text-[#ffd13b] uppercase focus:outline-none focus:border-[#ffd13b]"
                 />
@@ -327,16 +327,32 @@ export const LobbyModal: React.FC<LobbyModalProps> = ({
               </div>
 
               {isHost ? (
-                <button
-                  type="button"
-                  onClick={onStartOnlineGame}
-                  className="wood-btn-primary px-7 py-3 rounded-2xl font-black text-lg cursor-pointer"
-                >
-                  ابدأ الجولة للجميع!
-                </button>
+                <div className="flex flex-col items-end gap-1.5">
+                  {(() => {
+                    const unreadyHumans = roomSnapshot.sim.players.filter(
+                      (p) => p.connected && !p.isBot && !p.ready,
+                    );
+                    return (
+                      <>
+                        {unreadyHumans.length > 0 && (
+                          <span className="text-xs font-bold text-[#ffd166]">
+                            بانتظار جاهزية: {unreadyHumans.map((p) => p.name).join('، ')}
+                          </span>
+                        )}
+                        <button
+                          type="button"
+                          onClick={onStartOnlineGame}
+                          className="wood-btn-primary px-7 py-3 rounded-2xl font-black text-lg cursor-pointer"
+                        >
+                          ابدأ الجولة للجميع!
+                        </button>
+                      </>
+                    );
+                  })()}
+                </div>
               ) : (
                 <span className="text-sm font-bold text-[#ffd166]">
-                  بانتظار المضيف لبدء الجولة...
+                  {me?.ready ? 'تم تأكيد جاهزيتك — بانتظار المضيف...' : 'اضغط "أنا جاهز!" لكي يتمكن المضيف من البدء'}
                 </span>
               )}
             </div>

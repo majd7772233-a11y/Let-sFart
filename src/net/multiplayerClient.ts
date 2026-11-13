@@ -1,20 +1,54 @@
+import {
+  makeEnvelope,
+  PROTOCOL_VERSION,
+  type HttpErrorResponse,
+  type ProtocolEnvelope,
+  type RoomSessionCredentials,
+  type ServerProtocolMessage,
+} from '../shared/protocol.ts';
 import type {
-  ClientToServerMessage,
   ConnectionStatus,
   PlayerCosmetic,
+  PlayerRole,
   RoomSnapshot,
-  ServerToClientMessage,
+  SimEvent,
 } from '../shared/types.ts';
 
 export interface MultiplayerCallbacks {
-  onJoined: (data: { roomCode: string; playerId: string; slot: 0 | 1 | 2 | 3; snapshot: RoomSnapshot }) => void;
+  onJoined: (data: {
+    roomCode: string;
+    playerId: string;
+    slot: 0 | 1 | 2 | 3;
+    role: PlayerRole;
+    snapshot: RoomSnapshot;
+  }) => void;
   onState: (snapshot: RoomSnapshot) => void;
-  onError: (message: string) => void;
+  onEvents?: (events: SimEvent[]) => void;
+  onError: (message: string, code?: string) => void;
   onConnectionChange: (status: ConnectionStatus) => void;
 }
 
 const INPUT_KEEPALIVE_MS = 850;
 const MAX_RECONNECT_ATTEMPTS = 7;
+const RESYNC_THROTTLE_MS = 1500;
+
+function getApiBaseUrl(): string {
+  const configured = (import.meta.env?.VITE_API_BASE_URL as string | undefined)?.trim();
+  return configured ? configured.replace(/\/+$/, '') : '';
+}
+
+function getWsBaseUrl(): string {
+  const configuredWs = (import.meta.env?.VITE_WS_BASE_URL as string | undefined)?.trim();
+  if (configuredWs) return configuredWs.replace(/\/+$/, '');
+
+  const configuredApi = getApiBaseUrl();
+  if (configuredApi) {
+    return configuredApi.replace(/^http/i, 'ws');
+  }
+
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${protocol}//${window.location.host}`;
+}
 
 export class MultiplayerClient {
   private ws: WebSocket | null = null;
@@ -23,6 +57,12 @@ export class MultiplayerClient {
   private currentMoveDir: -1 | 0 | 1 = 0;
   private currentFarting = false;
   private seq = 0;
+  private requestCounter = 0;
+
+  private lastSnapshotSeq = 0;
+  private lastEventId = 0;
+  private lastResyncRequestAtMs = 0;
+  private lastLatencyMs = 0;
 
   private pingTimer: number | null = null;
   private inputKeepaliveTimer: number | null = null;
@@ -30,8 +70,10 @@ export class MultiplayerClient {
 
   private roomCode: string | null = null;
   private playerId: string | null = null;
-  private playerName = 'أنت';
-  private cosmetic: PlayerCosmetic | null = null;
+  private resumeToken: string | null = null;
+  private sessionId: string | null = null;
+  private connectionEpoch = 0;
+  private role: PlayerRole = 'PLAYER';
 
   private connectionStatus: ConnectionStatus = 'disconnected';
   private intentionalLeave = false;
@@ -41,6 +83,15 @@ export class MultiplayerClient {
 
   constructor(callbacks: MultiplayerCallbacks) {
     this.callbacks = callbacks;
+  }
+
+  public getLastLatencyMs(): number {
+    return this.lastLatencyMs;
+  }
+
+  private nextRequestId(): string {
+    this.requestCounter += 1;
+    return `req-${this.requestCounter}`;
   }
 
   private setStatus(status: ConnectionStatus): void {
@@ -82,12 +133,13 @@ export class MultiplayerClient {
             this.ws.readyState === WebSocket.OPEN
           ) {
             this.seq += 1;
-            this.send({
-              type: 'input:state',
-              moveDir: this.currentMoveDir,
-              farting: this.currentFarting,
-              seq: this.seq,
-            });
+            this.sendEnvelope(
+              makeEnvelope('input:state', {
+                moveDir: this.currentMoveDir,
+                farting: this.currentFarting,
+                seq: this.seq,
+              }),
+            );
           } else {
             this.clearInputKeepalive();
           }
@@ -98,9 +150,23 @@ export class MultiplayerClient {
     }
   }
 
+  private authenticateCurrentSocket(): void {
+    if (!this.playerId || !this.resumeToken) return;
+    this.sendEnvelope(
+      makeEnvelope(
+        'session:authenticate',
+        {
+          playerId: this.playerId,
+          resumeToken: this.resumeToken,
+        },
+        this.nextRequestId(),
+      ),
+    );
+  }
+
   private scheduleReconnect(): void {
     if (this.disposed || this.intentionalLeave) return;
-    if (!this.roomCode || !this.playerId || !this.cosmetic) {
+    if (!this.roomCode || !this.playerId || !this.resumeToken) {
       this.setStatus('disconnected');
       return;
     }
@@ -108,6 +174,7 @@ export class MultiplayerClient {
     if (this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
       this.roomCode = null;
       this.playerId = null;
+      this.resumeToken = null;
       this.setStatus('disconnected');
       this.callbacks.onError('انقطع الاتصال بالخادم وتعذرت إعادة الاتصال.');
       return;
@@ -119,33 +186,26 @@ export class MultiplayerClient {
 
     this.reconnectTimer = window.setTimeout(() => {
       this.reconnectTimer = null;
-      if (this.disposed || this.intentionalLeave || !this.roomCode || !this.playerId || !this.cosmetic) {
+      if (this.disposed || this.intentionalLeave || !this.roomCode || !this.playerId || !this.resumeToken) {
         return;
       }
-      this.connect(true)
+      this.connect(this.roomCode, true)
         .then(() => {
-          if (this.roomCode && this.playerId && this.cosmetic) {
-            this.send({
-              type: 'room:join',
-              roomCode: this.roomCode,
-              name: this.playerName,
-              cosmetic: this.cosmetic,
-              playerId: this.playerId,
-            });
-            // Re-sync currently held input right after reconnecting
-            this.lastInputKey = '';
-            if (this.currentFarting || this.currentMoveDir !== 0) {
-              this.sendInput(this.currentMoveDir, this.currentFarting, true);
-            }
+          this.lastInputKey = '';
+          if (this.currentFarting || this.currentMoveDir !== 0) {
+            this.sendInput(this.currentMoveDir, this.currentFarting, true);
           }
         })
         .catch(() => {
-          // ws.onclose / onerror will trigger next reconnect attempt
+          // ws.onclose / onerror will schedule the next retry
         });
     }, delayMs);
   }
 
-  public connect(isReconnect = false): Promise<void> {
+  /**
+   * Connects WebSocket to a room route (`/ws/rooms/:code` or roomCode).
+   */
+  public connect(roomCodeOrPath: string, isReconnect = false): Promise<void> {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       return Promise.resolve();
     }
@@ -153,12 +213,15 @@ export class MultiplayerClient {
       return this.connectPromise;
     }
 
+    const wsPath = roomCodeOrPath.startsWith('/ws/')
+      ? roomCodeOrPath
+      : `/ws/rooms/${encodeURIComponent(roomCodeOrPath)}`;
+
     this.clearReconnectTimer();
     this.setStatus(isReconnect ? 'reconnecting' : 'connecting');
 
     this.connectPromise = new Promise<void>((resolve, reject) => {
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const url = `${protocol}//${window.location.host}/ws`;
+      const url = `${getWsBaseUrl()}${wsPath}`;
       const ws = new WebSocket(url);
       this.ws = ws;
       let settled = false;
@@ -168,36 +231,117 @@ export class MultiplayerClient {
         settled = true;
         this.connectPromise = null;
         this.reconnectAttempts = 0;
-        this.setStatus('connected');
+
+        this.authenticateCurrentSocket();
 
         this.clearPingTimer();
         this.pingTimer = window.setInterval(() => {
-          this.send({ type: 'ping' });
+          this.sendEnvelope(makeEnvelope('ping', { clientTime: Date.now() }));
         }, 4000);
         this.syncInputKeepaliveTimer();
         resolve();
       };
 
       ws.onmessage = (ev) => {
-        let msg: ServerToClientMessage;
+        let msg: ServerProtocolMessage;
         try {
-          msg = JSON.parse(String(ev.data)) as ServerToClientMessage;
+          msg = JSON.parse(String(ev.data)) as ServerProtocolMessage;
         } catch {
           return;
         }
-        if (msg.type === 'room:joined') {
-          this.roomCode = msg.roomCode;
-          this.playerId = msg.playerId;
-          this.callbacks.onJoined(msg);
-        } else if (msg.type === 'room:state') {
-          this.callbacks.onState(msg.snapshot);
-        } else if (msg.type === 'room:error') {
-          if (this.connectionStatus === 'reconnecting') {
-            this.roomCode = null;
-            this.playerId = null;
-            this.intentionalLeave = true;
+        if (!msg || msg.version !== PROTOCOL_VERSION) return;
+
+        switch (msg.type) {
+          case 'session:renewed':
+            this.roomCode = msg.payload!.roomCode;
+            this.playerId = msg.payload!.playerId;
+            this.resumeToken = msg.payload!.resumeToken;
+            this.sessionId = msg.payload!.sessionId;
+            this.connectionEpoch = msg.payload!.connectionEpoch;
+            this.role = msg.payload!.role;
+            this.seq = 0;
+            this.setStatus('connected');
+            break;
+
+          case 'room:joined': {
+            const snap = msg.payload!.snapshot;
+            this.roomCode = msg.payload!.roomCode;
+            this.playerId = msg.payload!.playerId;
+            this.sessionId = msg.payload!.sessionId;
+            this.connectionEpoch = msg.payload!.connectionEpoch;
+            this.role = msg.payload!.role;
+            this.lastSnapshotSeq = snap.snapshotSeq;
+            this.lastEventId = Math.max(this.lastEventId, snap.sim.eventSeq ?? 0);
+            this.setStatus('connected');
+            this.callbacks.onJoined({
+              roomCode: msg.payload!.roomCode,
+              playerId: msg.payload!.playerId,
+              slot: msg.payload!.slot,
+              role: msg.payload!.role,
+              snapshot: snap,
+            });
+            break;
           }
-          this.callbacks.onError(msg.message);
+
+          case 'room:state': {
+            const snap = msg.payload!.snapshot;
+            if (snap.snapshotSeq < this.lastSnapshotSeq) return;
+            this.lastSnapshotSeq = snap.snapshotSeq;
+            this.lastEventId = Math.max(this.lastEventId, snap.sim.eventSeq ?? 0);
+            this.callbacks.onState(snap);
+            break;
+          }
+
+          case 'game:snapshot': {
+            const snap = msg.payload!.snapshot;
+            if (snap.snapshotSeq <= this.lastSnapshotSeq) {
+              return;
+            }
+            if (this.lastSnapshotSeq > 0 && snap.snapshotSeq > this.lastSnapshotSeq + 1) {
+              const now = Date.now();
+              if (now - this.lastResyncRequestAtMs >= RESYNC_THROTTLE_MS) {
+                this.lastResyncRequestAtMs = now;
+                this.requestResync();
+              }
+            }
+            this.lastSnapshotSeq = snap.snapshotSeq;
+            this.callbacks.onState(snap);
+            break;
+          }
+
+          case 'game:event': {
+            const freshEvents = msg.payload!.events.filter((e) => e.id > this.lastEventId);
+            if (freshEvents.length > 0) {
+              this.lastEventId = freshEvents[freshEvents.length - 1].id;
+              this.callbacks.onEvents?.(freshEvents);
+            }
+            break;
+          }
+
+          case 'pong':
+            if (typeof msg.payload?.clientTime === 'number') {
+              this.lastLatencyMs = Math.max(0, Date.now() - msg.payload.clientTime);
+            }
+            break;
+
+          case 'room:error': {
+            const code = msg.payload!.code;
+            if (
+              code === 'SESSION_REPLACED' ||
+              code === 'SESSION_EXPIRED' ||
+              code === 'UNAUTHORIZED' ||
+              code === 'ROOM_NOT_FOUND' ||
+              code === 'ROOM_CLOSED' ||
+              code === 'FORBIDDEN_ORIGIN'
+            ) {
+              this.intentionalLeave = true;
+              this.roomCode = null;
+              this.playerId = null;
+              this.resumeToken = null;
+            }
+            this.callbacks.onError(msg.payload!.message, code);
+            break;
+          }
         }
       };
 
@@ -222,7 +366,7 @@ export class MultiplayerClient {
           reject(new Error('تعذر الاتصال بالخادم'));
         }
 
-        if (!this.disposed && !this.intentionalLeave && this.roomCode && this.playerId) {
+        if (!this.disposed && !this.intentionalLeave && this.roomCode && this.playerId && this.resumeToken) {
           this.scheduleReconnect();
         } else {
           this.setStatus('disconnected');
@@ -233,56 +377,97 @@ export class MultiplayerClient {
     return this.connectPromise;
   }
 
-  private send(msg: ClientToServerMessage): void {
+  private sendEnvelope(msg: ProtocolEnvelope): void {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(msg));
     }
   }
 
+  private applyIssuedCredentials(creds: RoomSessionCredentials): void {
+    this.roomCode = creds.roomCode;
+    this.playerId = creds.playerId;
+    this.resumeToken = creds.resumeToken;
+    this.sessionId = creds.sessionId;
+    this.connectionEpoch = creds.connectionEpoch;
+    this.role = creds.role;
+    this.lastSnapshotSeq = 0;
+    this.lastEventId = 0;
+  }
+
   public async createRoom(name: string, cosmetic: PlayerCosmetic): Promise<void> {
     this.intentionalLeave = false;
     this.reconnectAttempts = 0;
-    this.playerName = name;
-    this.cosmetic = cosmetic;
-    await this.connect(false);
-    this.send({ type: 'room:create', name, cosmetic });
+    this.setStatus('connecting');
+
+    const idempotencyKey = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
+    const res = await fetch(`${getApiBaseUrl()}/api/v1/rooms`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name, cosmetic, idempotencyKey }),
+    });
+
+    if (!res.ok) {
+      this.setStatus('disconnected');
+      const errBody = (await res.json().catch(() => null)) as HttpErrorResponse | null;
+      throw new Error(errBody?.error?.message || 'تعذر إنشاء الغرفة');
+    }
+
+    const creds = (await res.json()) as RoomSessionCredentials;
+    this.applyIssuedCredentials(creds);
+    await this.connect(creds.roomCode, false);
   }
 
   public async joinRoom(roomCode: string, name: string, cosmetic: PlayerCosmetic): Promise<void> {
     this.intentionalLeave = false;
     this.reconnectAttempts = 0;
-    this.playerName = name;
-    this.cosmetic = cosmetic;
+    this.setStatus('connecting');
+
     const normalizedCode = roomCode.trim().toUpperCase();
-    await this.connect(false);
-    this.send({
-      type: 'room:join',
-      roomCode: normalizedCode,
-      name,
-      cosmetic,
-      playerId: this.roomCode === normalizedCode ? (this.playerId ?? undefined) : undefined,
+    const res = await fetch(`${getApiBaseUrl()}/api/v1/rooms/${encodeURIComponent(normalizedCode)}/join`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name, cosmetic }),
     });
+
+    if (!res.ok) {
+      this.setStatus('disconnected');
+      const errBody = (await res.json().catch(() => null)) as HttpErrorResponse | null;
+      throw new Error(errBody?.error?.message || 'تعذر الانضمام للغرفة');
+    }
+
+    const creds = (await res.json()) as RoomSessionCredentials;
+    this.applyIssuedCredentials(creds);
+    await this.connect(creds.roomCode, false);
   }
 
   public setReady(ready: boolean): void {
-    this.send({ type: 'room:ready', ready });
+    this.sendEnvelope(makeEnvelope('room:ready', { ready }, this.nextRequestId()));
   }
 
   public updateCosmetic(cosmetic: PlayerCosmetic): void {
-    this.cosmetic = cosmetic;
-    this.send({ type: 'room:cosmetic', cosmetic });
+    this.sendEnvelope(makeEnvelope('room:cosmetic', { cosmetic }, this.nextRequestId()));
   }
 
   public toggleBots(fillBots: boolean): void {
-    this.send({ type: 'room:toggleBots', fillBots });
+    this.sendEnvelope(makeEnvelope('room:toggleBots', { fillBots }, this.nextRequestId()));
   }
 
   public startGame(): void {
-    this.send({ type: 'room:start' });
+    this.sendEnvelope(makeEnvelope('room:start', {}, this.nextRequestId()));
   }
 
   public restartGame(): void {
-    this.send({ type: 'room:restart' });
+    this.sendEnvelope(makeEnvelope('room:restart', {}, this.nextRequestId()));
+  }
+
+  public requestResync(): void {
+    this.sendEnvelope(
+      makeEnvelope(
+        'game:resync',
+        { lastEventId: this.lastEventId, lastSnapshotSeq: this.lastSnapshotSeq },
+        this.nextRequestId(),
+      ),
+    );
   }
 
   public sendInput(moveDir: -1 | 0 | 1, farting: boolean, force = false): void {
@@ -292,7 +477,7 @@ export class MultiplayerClient {
     if (force || key !== this.lastInputKey) {
       this.lastInputKey = key;
       this.seq += 1;
-      this.send({ type: 'input:state', moveDir, farting, seq: this.seq });
+      this.sendEnvelope(makeEnvelope('input:state', { moveDir, farting, seq: this.seq }));
     }
     this.syncInputKeepaliveTimer();
   }
@@ -300,13 +485,30 @@ export class MultiplayerClient {
   public leaveRoom(): void {
     this.intentionalLeave = true;
     this.clearReconnectTimer();
+    this.clearPingTimer();
     this.clearInputKeepalive();
     this.currentMoveDir = 0;
     this.currentFarting = false;
     this.lastInputKey = '';
-    this.send({ type: 'room:leave' });
+    this.lastSnapshotSeq = 0;
+    this.lastEventId = 0;
+    this.sendEnvelope(makeEnvelope('room:leave', {}, this.nextRequestId()));
     this.roomCode = null;
     this.playerId = null;
+    this.resumeToken = null;
+    this.sessionId = null;
+    if (this.ws) {
+      const ws = this.ws;
+      this.ws = null;
+      window.setTimeout(() => {
+        try {
+          ws.close(1000, 'LEFT_ROOM');
+        } catch {
+          // ignore
+        }
+      }, 40);
+    }
+    this.setStatus('disconnected');
   }
 
   public dispose(): void {
@@ -317,6 +519,8 @@ export class MultiplayerClient {
     this.clearInputKeepalive();
     this.roomCode = null;
     this.playerId = null;
+    this.resumeToken = null;
+    this.sessionId = null;
     if (this.ws) {
       this.ws.close();
       this.ws = null;

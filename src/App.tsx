@@ -87,8 +87,6 @@ export default function App() {
     active?.blur?.();
     if (roomSnapshotRef.current) {
       netRef.current?.restartGame();
-      setScreen('playing');
-      sceneRef.current?.setScreenState('playing');
     } else {
       setScreen('playing');
       sceneRef.current?.startSoloGame(playerName, cosmetic);
@@ -134,6 +132,9 @@ export default function App() {
       onState: (snapshot) => {
         setRoomSnapshot(snapshot);
         sceneRef.current?.setOnlineRoomState(snapshot, mySlotRef.current, false);
+      },
+      onEvents: (events) => {
+        sceneRef.current?.processDiscreteEvents(events);
       },
       onError: (msg) => {
         setLobbyError(msg);
