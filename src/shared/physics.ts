@@ -71,6 +71,7 @@ export function createPlayerState(
     connected: opts?.connected ?? false,
     isBot: opts?.isBot ?? false,
     ready: opts?.isBot ?? false,
+    seatStatus: opts?.isBot ? 'BOT' : opts?.connected ? 'CONNECTED' : 'EMPTY',
     cosmetic: opts?.cosmetic ?? createDefaultCosmetic(slot),
     localX: zone.defaultX,
     lateralVel: 0,

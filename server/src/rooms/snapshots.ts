@@ -1,5 +1,6 @@
 import type { RoomPublicInfoResponse } from '../../../src/shared/protocol.ts';
-import type { RoomSnapshot, SimEvent } from '../../../src/shared/types.ts';
+import type { PlayerSimState, RoomSnapshot, SeatStatus, SimEvent } from '../../../src/shared/types.ts';
+import { getSeatStatusSnapshot } from './lifecycle.ts';
 import { MAX_PLAYERS, type RoomRecord } from './types.ts';
 
 /**
@@ -7,6 +8,18 @@ import { MAX_PLAYERS, type RoomRecord } from './types.ts';
  * Never includes resumeToken, resumeTokenHash, sessionId, or idempotencyKey.
  */
 export function buildRoomSnapshot(room: RoomRecord, nowMs = Date.now()): RoomSnapshot {
+  const seats: [SeatStatus, SeatStatus, SeatStatus, SeatStatus] = [
+    getSeatStatusSnapshot(room, 0, nowMs),
+    getSeatStatusSnapshot(room, 1, nowMs),
+    getSeatStatusSnapshot(room, 2, nowMs),
+    getSeatStatusSnapshot(room, 3, nowMs),
+  ];
+
+  const players = room.sim.players.map((p, idx) => ({
+    ...p,
+    seatStatus: seats[idx],
+  })) as [PlayerSimState, PlayerSimState, PlayerSimState, PlayerSimState];
+
   return {
     roomCode: room.roomCode,
     hostId: room.hostId,
@@ -14,8 +27,10 @@ export function buildRoomSnapshot(room: RoomRecord, nowMs = Date.now()): RoomSna
     lifecycleState: room.lifecycleState,
     snapshotSeq: Math.max(1, room.snapshotSeq),
     serverTime: nowMs,
+    seats,
     sim: {
       ...room.sim,
+      players,
       events: room.recentEvents.slice(),
     },
   };

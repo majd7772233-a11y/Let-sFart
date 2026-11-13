@@ -47,12 +47,16 @@ export async function joinRoomHttp(
   env: ReturnType<typeof createLocalWorkerEnv>['env'],
   roomCode: string,
   name: string,
+  idempotencyKey?: string,
 ): Promise<Response> {
   return routeWorkerRequest(
     new Request(`http://localhost/api/v1/rooms/${roomCode}/join`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name }),
+      body: JSON.stringify({
+        name,
+        ...(idempotencyKey ? { idempotencyKey } : {}),
+      }),
     }),
     env,
   );

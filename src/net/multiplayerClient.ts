@@ -164,6 +164,40 @@ export class MultiplayerClient {
     );
   }
 
+  private clearActiveSocket(closeReason?: string): void {
+    const existingWs = this.ws;
+    this.ws = null;
+    this.connectPromise = null;
+    this.clearPingTimer();
+    this.clearInputKeepalive();
+    if (existingWs) {
+      try {
+        if (existingWs.readyState === WebSocket.OPEN || existingWs.readyState === WebSocket.CONNECTING) {
+          existingWs.close(1000, closeReason ?? 'RESET');
+        }
+      } catch {
+        // ignore close errors
+      }
+    }
+  }
+
+  private terminateSessionAndCloseSocket(reason = 'TERMINATED'): void {
+    this.intentionalLeave = true;
+    this.clearReconnectTimer();
+    this.clearActiveSocket(reason);
+    this.currentMoveDir = 0;
+    this.currentFarting = false;
+    this.lastInputKey = '';
+    this.lastSnapshotSeq = 0;
+    this.lastEventId = 0;
+    this.roomCode = null;
+    this.playerId = null;
+    this.resumeToken = null;
+    this.sessionId = null;
+    this.connectionEpoch = 0;
+    this.setStatus('disconnected');
+  }
+
   private scheduleReconnect(): void {
     if (this.disposed || this.intentionalLeave) return;
     if (!this.roomCode || !this.playerId || !this.resumeToken) {
@@ -172,10 +206,7 @@ export class MultiplayerClient {
     }
     if (this.reconnectTimer !== null) return;
     if (this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-      this.roomCode = null;
-      this.playerId = null;
-      this.resumeToken = null;
-      this.setStatus('disconnected');
+      this.terminateSessionAndCloseSocket('MAX_RECONNECT_EXCEEDED');
       this.callbacks.onError('انقطع الاتصال بالخادم وتعذرت إعادة الاتصال.');
       return;
     }
@@ -243,6 +274,7 @@ export class MultiplayerClient {
       };
 
       ws.onmessage = (ev) => {
+        if (this.ws !== ws) return;
         let msg: ServerProtocolMessage;
         try {
           msg = JSON.parse(String(ev.data)) as ServerProtocolMessage;
@@ -334,10 +366,7 @@ export class MultiplayerClient {
               code === 'ROOM_CLOSED' ||
               code === 'FORBIDDEN_ORIGIN'
             ) {
-              this.intentionalLeave = true;
-              this.roomCode = null;
-              this.playerId = null;
-              this.resumeToken = null;
+              this.terminateSessionAndCloseSocket(code);
             }
             this.callbacks.onError(msg.payload!.message, code);
             break;
@@ -346,6 +375,7 @@ export class MultiplayerClient {
       };
 
       ws.onerror = () => {
+        if (this.ws !== ws) return;
         if (!settled) {
           settled = true;
           this.connectPromise = null;
@@ -354,9 +384,10 @@ export class MultiplayerClient {
       };
 
       ws.onclose = () => {
-        if (this.ws === ws) {
-          this.ws = null;
+        if (this.ws !== ws) {
+          return;
         }
+        this.ws = null;
         this.connectPromise = null;
         this.clearPingTimer();
         this.clearInputKeepalive();
@@ -394,12 +425,18 @@ export class MultiplayerClient {
     this.lastEventId = 0;
   }
 
-  public async createRoom(name: string, cosmetic: PlayerCosmetic): Promise<void> {
+  public async createRoom(
+    name: string,
+    cosmetic: PlayerCosmetic,
+    customIdempotencyKey?: string,
+  ): Promise<void> {
+    this.terminateSessionAndCloseSocket('NEW_SESSION');
     this.intentionalLeave = false;
     this.reconnectAttempts = 0;
     this.setStatus('connecting');
 
-    const idempotencyKey = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
+    const idempotencyKey =
+      customIdempotencyKey ?? (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`);
     const res = await fetch(`${getApiBaseUrl()}/api/v1/rooms`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -417,16 +454,24 @@ export class MultiplayerClient {
     await this.connect(creds.roomCode, false);
   }
 
-  public async joinRoom(roomCode: string, name: string, cosmetic: PlayerCosmetic): Promise<void> {
+  public async joinRoom(
+    roomCode: string,
+    name: string,
+    cosmetic: PlayerCosmetic,
+    customIdempotencyKey?: string,
+  ): Promise<void> {
+    this.terminateSessionAndCloseSocket('NEW_SESSION');
     this.intentionalLeave = false;
     this.reconnectAttempts = 0;
     this.setStatus('connecting');
 
     const normalizedCode = roomCode.trim().toUpperCase();
+    const idempotencyKey =
+      customIdempotencyKey ?? (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`);
     const res = await fetch(`${getApiBaseUrl()}/api/v1/rooms/${encodeURIComponent(normalizedCode)}/join`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name, cosmetic }),
+      body: JSON.stringify({ name, cosmetic, idempotencyKey }),
     });
 
     if (!res.ok) {

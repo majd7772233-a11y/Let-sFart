@@ -30,6 +30,8 @@ export interface PlayerStats {
   wallImpactCount: number;
 }
 
+export type SeatStatus = 'EMPTY' | 'BOT' | 'CONNECTED' | 'RECONNECTING';
+
 export interface PlayerSimState {
   slot: 0 | 1 | 2 | 3;
   id: string;
@@ -37,6 +39,7 @@ export interface PlayerSimState {
   connected: boolean;
   isBot: boolean;
   ready: boolean;
+  seatStatus?: SeatStatus;
   cosmetic: PlayerCosmetic;
   localX: number;
   lateralVel: number;
@@ -183,6 +186,7 @@ export interface RoomSnapshot {
   lifecycleState?: RoomLifecycleState;
   snapshotSeq: number;
   serverTime: number;
+  seats?: [SeatStatus, SeatStatus, SeatStatus, SeatStatus];
   sim: WorldSimulationState;
 }
 

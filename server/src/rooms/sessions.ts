@@ -16,6 +16,8 @@ export interface IssuedSessionCredentials {
 }
 
 export class SessionManager {
+  private rotatingPlayers = new Set<string>();
+
   public async createSession(opts: {
     roomCode: string;
     slot: 0 | 1 | 2 | 3;
@@ -52,8 +54,8 @@ export class SessionManager {
   }
 
   /**
-   * Authenticates a WebSocket using (playerId + resumeToken), rejects playerId-only attempts,
-   * enforces single-active-socket replacement, and rotates resumeToken on success.
+   * Authenticates a WebSocket using (playerId + resumeToken), rejects playerId-only or concurrent race attempts,
+   * verifies CAS before committing, enforces single-active-socket replacement, and rotates resumeToken atomically.
    */
   public async authenticateAndRotate(opts: {
     room: RoomRecord;
@@ -62,6 +64,12 @@ export class SessionManager {
     nowMs?: number;
   }): Promise<{ session: PlayerSessionRecord; newResumeToken: string; replacedOldEpoch: boolean }> {
     const nowMs = opts.nowMs ?? Date.now();
+    const lockKey = `${opts.room.roomCode}:${opts.playerId}`;
+
+    if (this.rotatingPlayers.has(lockKey)) {
+      throw new ProtocolError('UNAUTHORIZED', 'عملية المصادقة قيد التنفيذ بالفعل، يرجى المحاولة مجدداً.', 401);
+    }
+
     const session = opts.room.sessions.get(opts.playerId);
 
     if (!session || session.revoked || session.roomCode !== opts.room.roomCode) {
@@ -78,23 +86,41 @@ export class SessionManager {
       throw new ProtocolError('SESSION_EXPIRED', 'انتهت مهلة إعادة الاتصال الخاصة بهذه الجلسة.', 401);
     }
 
-    const valid = await verifyTokenHash(opts.resumeToken, session.resumeTokenHash);
-    if (!valid) {
-      throw new ProtocolError('UNAUTHORIZED', 'رمز استعادة الجلسة غير صحيح.', 401);
+    const expectedHash = session.resumeTokenHash;
+    const expectedEpoch = session.connectionEpoch;
+    this.rotatingPlayers.add(lockKey);
+
+    try {
+      const valid = await verifyTokenHash(opts.resumeToken, expectedHash);
+      if (!valid) {
+        throw new ProtocolError('UNAUTHORIZED', 'رمز استعادة الجلسة غير صحيح.', 401);
+      }
+
+      const newResumeToken = generateResumeToken();
+      const newResumeTokenHash = await hashToken(newResumeToken);
+
+      // Atomic Compare-And-Swap guard: reject if state mutated across await boundaries
+      if (
+        session.revoked ||
+        session.resumeTokenHash !== expectedHash ||
+        session.connectionEpoch !== expectedEpoch
+      ) {
+        throw new ProtocolError('UNAUTHORIZED', 'انتهت صلاحية رمز الاستعادة أو تم استبداله.', 401);
+      }
+
+      const replacedOldEpoch = session.connected;
+      session.resumeTokenHash = newResumeTokenHash;
+      session.connectionEpoch += 1;
+      session.sessionId = generateSessionId();
+      session.connected = true;
+      session.lastSeenAt = nowMs;
+      session.expiresAt = nowMs + SESSION_TTL_MS;
+      session.lastInputSeq = 0; // Fresh sequence window bound to new connectionEpoch
+
+      return { session, newResumeToken, replacedOldEpoch };
+    } finally {
+      this.rotatingPlayers.delete(lockKey);
     }
-
-    const newResumeToken = generateResumeToken();
-    session.resumeTokenHash = await hashToken(newResumeToken);
-
-    const replacedOldEpoch = session.connected;
-    session.connectionEpoch += 1;
-    session.sessionId = generateSessionId();
-    session.connected = true;
-    session.lastSeenAt = nowMs;
-    session.expiresAt = nowMs + SESSION_TTL_MS;
-    session.lastInputSeq = 0; // Fresh sequence window bound to new connectionEpoch
-
-    return { session, newResumeToken, replacedOldEpoch };
   }
 
   public assertActiveSessionBinding(

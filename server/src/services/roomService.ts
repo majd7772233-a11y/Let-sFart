@@ -5,24 +5,9 @@ import type {
 } from '../../../src/shared/protocol.ts';
 import { INTERNAL_HEADER_NAME, INTERNAL_HEADER_VALUE, type Env } from '../env.ts';
 import { generateRoomCode, isValidRoomCode, normalizeRoomCode } from '../lib/roomCode.ts';
+import { hashToken } from '../lib/tokens.ts';
 import { sanitizeCosmeticOrDefault, sanitizePlayerName } from '../lib/validation.ts';
 import { ProtocolError } from '../protocol/errors.ts';
-
-interface IdempotentCacheEntry {
-  creds: RoomSessionCredentials;
-  cachedAt: number;
-}
-
-const IDEMPOTENCY_TTL_MS = 60_000;
-const recentIdempotentCreations = new Map<string, IdempotentCacheEntry>();
-
-function pruneIdempotencyCache(nowMs: number): void {
-  for (const [k, v] of recentIdempotentCreations.entries()) {
-    if (nowMs - v.cachedAt > IDEMPOTENCY_TTL_MS) {
-      recentIdempotentCreations.delete(k);
-    }
-  }
-}
 
 function makeInternalRequest(path: string, init?: RequestInit): Request {
   const headers = new Headers(init?.headers);
@@ -37,42 +22,62 @@ function makeInternalRequest(path: string, init?: RequestInit): Request {
 }
 
 export function clearRoomServiceCache(): void {
-  recentIdempotentCreations.clear();
+  // No Worker-local mutable idempotency cache remains; state lives durably in Durable Objects.
 }
 
 export async function createRoomViaService(
   env: Env,
   input: CreateRoomHttpRequest,
 ): Promise<{ status: number; creds: RoomSessionCredentials }> {
-  const nowMs = Date.now();
-  pruneIdempotencyCache(nowMs);
-
   const idempotencyKey =
     typeof input.idempotencyKey === 'string' && input.idempotencyKey.trim().length > 0
       ? input.idempotencyKey.trim().slice(0, 128)
       : undefined;
 
-  if (idempotencyKey) {
-    const hit = recentIdempotentCreations.get(idempotencyKey);
-    if (hit) {
-      return { status: 200, creds: hit.creds };
-    }
-  }
-
   const name = sanitizePlayerName(input.name, 'قبطان');
   const cosmetic = sanitizeCosmeticOrDefault(input.cosmetic, 0);
 
+  const keyHash = idempotencyKey ? await hashToken(idempotencyKey) : null;
+  const idemStub = keyHash
+    ? env.ROOMS.get(env.ROOMS.idFromName(`__IDEM_${keyHash.slice(0, 2)}`))
+    : null;
+
   for (let attempt = 0; attempt < 8; attempt++) {
-    const roomCode = generateRoomCode();
-    const stub = env.ROOMS.get(env.ROOMS.idFromName(roomCode));
+    const candidateRoomCode = generateRoomCode();
+    let targetRoomCode = candidateRoomCode;
+    let claimed = false;
+
+    if (idemStub && keyHash) {
+      const claimRes = await idemStub.fetch(
+        makeInternalRequest('/internal/idem-claim', {
+          method: 'POST',
+          body: JSON.stringify({ keyHash, candidateRoomCode }),
+        }),
+      );
+      if (claimRes.ok) {
+        const claimData = (await claimRes.json()) as { roomCode: string; claimed: boolean };
+        targetRoomCode = claimData.roomCode;
+        claimed = claimData.claimed;
+      }
+    }
+
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(targetRoomCode));
     const res = await stub.fetch(
       makeInternalRequest('/internal/create', {
         method: 'POST',
-        body: JSON.stringify({ roomCode, name, cosmetic, idempotencyKey }),
+        body: JSON.stringify({ roomCode: targetRoomCode, name, cosmetic, idempotencyKey }),
       }),
     );
 
     if (res.status === 409) {
+      if (idemStub && keyHash && claimed) {
+        await idemStub.fetch(
+          makeInternalRequest('/internal/idem-release', {
+            method: 'POST',
+            body: JSON.stringify({ keyHash, candidateRoomCode: targetRoomCode }),
+          }),
+        );
+      }
       continue;
     }
 
@@ -86,10 +91,7 @@ export async function createRoomViaService(
     }
 
     const creds = (await res.json()) as RoomSessionCredentials;
-    if (idempotencyKey) {
-      recentIdempotentCreations.set(idempotencyKey, { creds, cachedAt: nowMs });
-    }
-    return { status: 201, creds };
+    return { status: res.status, creds };
   }
 
   throw new ProtocolError('INTERNAL_ERROR', 'تعذر توليد رمز غرفة فريد، يرجى المحاولة مجدداً.', 503);
@@ -105,6 +107,11 @@ export async function joinRoomViaService(
     throw new ProtocolError('INVALID_ROOM_CODE', undefined, 400);
   }
 
+  const idempotencyKey =
+    typeof input.idempotencyKey === 'string' && input.idempotencyKey.trim().length > 0
+      ? input.idempotencyKey.trim().slice(0, 128)
+      : undefined;
+
   const stub = env.ROOMS.get(env.ROOMS.idFromName(roomCode));
   return stub.fetch(
     makeInternalRequest('/internal/join', {
@@ -112,6 +119,7 @@ export async function joinRoomViaService(
       body: JSON.stringify({
         name: sanitizePlayerName(input.name, 'لاعب'),
         cosmetic: sanitizeCosmeticOrDefault(input.cosmetic, 1),
+        ...(idempotencyKey ? { idempotencyKey } : {}),
       }),
     }),
   );

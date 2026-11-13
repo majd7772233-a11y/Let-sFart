@@ -1,5 +1,5 @@
 import { createPlayerState } from '../../../src/shared/physics.ts';
-import type { RoomLifecycleState } from '../../../src/shared/types.ts';
+import type { RoomLifecycleState, SeatStatus } from '../../../src/shared/types.ts';
 import { ProtocolError } from '../protocol/errors.ts';
 import {
   MAX_PLAYERS,
@@ -70,12 +70,35 @@ export function getSeatKind(
   return 'EMPTY';
 }
 
+export function getSeatStatusSnapshot(
+  room: RoomRecord,
+  slot: 0 | 1 | 2 | 3,
+  nowMs = Date.now(),
+): SeatStatus {
+  const kind = getSeatKind(room, slot, nowMs);
+  switch (kind) {
+    case 'HUMAN_CONNECTED':
+      return 'CONNECTED';
+    case 'HUMAN_DISCONNECTED_GRACE':
+      return 'RECONNECTING';
+    case 'BOT':
+      return 'BOT';
+    default:
+      return 'EMPTY';
+  }
+}
+
 /**
- * Finds an open seat slot (prefers genuinely EMPTY or BOT slots; never steals a seat in grace period).
+ * Finds an open seat slot (prefers genuinely EMPTY or BOT slots; never steals a seat in grace period or reserved in-flight).
  */
-export function findAvailableSeatSlot(room: RoomRecord, nowMs = Date.now()): 0 | 1 | 2 | 3 | null {
+export function findAvailableSeatSlot(
+  room: RoomRecord,
+  nowMs = Date.now(),
+  reservedSlots?: ReadonlySet<number>,
+): 0 | 1 | 2 | 3 | null {
   for (let i = 0; i < MAX_PLAYERS; i++) {
     const slot = i as 0 | 1 | 2 | 3;
+    if (reservedSlots?.has(slot)) continue;
     const kind = getSeatKind(room, slot, nowMs);
     if (kind === 'EMPTY' || kind === 'BOT') {
       return slot;
@@ -105,6 +128,7 @@ export function syncBotsInRoom(room: RoomRecord, nowMs = Date.now()): void {
         p.isBot = false;
         p.connected = session.connected;
         p.ready = session.ready;
+        p.seatStatus = session.connected ? 'CONNECTED' : 'RECONNECTING';
         if (!session.connected) {
           p.farting = false;
           p.moveDir = 0;
@@ -118,17 +142,21 @@ export function syncBotsInRoom(room: RoomRecord, nowMs = Date.now()): void {
       if (!existing || !existing.isBot || !existing.connected) {
         const bot = createPlayerState(slot, { isBot: true, connected: true });
         bot.ready = true;
+        bot.seatStatus = 'BOT';
         room.sim.players[slot] = bot;
       } else {
         existing.ready = true;
+        existing.seatStatus = 'BOT';
       }
     } else {
-      room.sim.players[slot] = createPlayerState(slot, {
+      const empty = createPlayerState(slot, {
         id: `empty-${slot}`,
         name: `مقعد ${slot + 1}`,
         isBot: false,
         connected: false,
       });
+      empty.seatStatus = 'EMPTY';
+      room.sim.players[slot] = empty;
     }
   }
 }

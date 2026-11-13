@@ -88,8 +88,8 @@ export async function handleRoomClientMessage(
         nowMs,
       });
 
-      const oldBinding = ctx.findSocketByPlayerId(session.playerId, ctx.binding.ws);
-      if (oldBinding) {
+      let oldBinding = ctx.findSocketByPlayerId(session.playerId, ctx.binding.ws);
+      while (oldBinding) {
         const cleared: SocketAttachment = {
           authenticated: false,
           playerId: null,
@@ -106,6 +106,7 @@ export async function handleRoomClientMessage(
           makeRoomErrorMsg('SESSION_REPLACED', undefined, undefined, 'session:authenticate'),
         );
         ctx.closeSocket(oldBinding.ws, 4001, 'SESSION_REPLACED');
+        oldBinding = ctx.findSocketByPlayerId(session.playerId, ctx.binding.ws);
       }
 
       ctx.binding.authenticated = true;
@@ -126,6 +127,7 @@ export async function handleRoomClientMessage(
       simPlayer.connected = true;
       simPlayer.isBot = false;
       simPlayer.ready = session.ready;
+      simPlayer.seatStatus = 'CONNECTED';
       simPlayer.lastInputAt = nowMs;
 
       syncBotsInRoom(ctx.room, nowMs);

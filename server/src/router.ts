@@ -128,9 +128,12 @@ export async function routeWorkerRequest(request: Request, env: Env): Promise<Re
         return jsonResp({ error: makeErrorPayload(bodyResult.code) }, bodyResult.status, request, env);
       }
       const data = isRecord(bodyResult.data) ? bodyResult.data : {};
+      const headerIdem = request.headers.get('idempotency-key') ?? undefined;
+      const bodyIdem = typeof data.idempotencyKey === 'string' ? data.idempotencyKey : undefined;
       const doRes = await joinRoomViaService(env, decodeURIComponent(joinMatch[1]), {
         name: typeof data.name === 'string' ? data.name : '',
         cosmetic: data.cosmetic as JoinRoomHttpRequest['cosmetic'],
+        idempotencyKey: bodyIdem ?? headerIdem,
       });
       return withCors(doRes, request, env);
     }

@@ -43,9 +43,11 @@ const V2_SCHEMA_STATEMENTS = [
     expires_at INTEGER NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS idx_room_players_slot ON room_players (room_code, slot)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uidx_room_players_active_slot ON room_players (room_code, slot) WHERE revoked = 0`,
   `CREATE TABLE IF NOT EXISTS room_state (
     room_code TEXT PRIMARY KEY,
     sim_json TEXT NOT NULL,
+    recent_events_json TEXT NOT NULL DEFAULT '[]',
     snapshot_seq INTEGER NOT NULL,
     last_event_seq INTEGER NOT NULL,
     saved_at INTEGER NOT NULL
@@ -101,6 +103,13 @@ export function initRoomSchema(sql: SqlStorageAdapter): void {
 
   for (const stmt of V2_SCHEMA_STATEMENTS) {
     sql.exec(stmt);
+  }
+
+  if (hasTable(sql, 'room_state')) {
+    const stateCols = getColumnNames(sql, 'room_state');
+    if (!stateCols.has('recent_events_json')) {
+      sql.exec(`ALTER TABLE room_state ADD COLUMN recent_events_json TEXT NOT NULL DEFAULT '[]'`);
+    }
   }
 
   if (hasTable(sql, 'room_sessions')) {

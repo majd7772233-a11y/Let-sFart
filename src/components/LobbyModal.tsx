@@ -1,6 +1,13 @@
 import React, { useState } from 'react';
 import { CHARACTER_PRESETS, PLAYER_ZONES } from '../shared/course.ts';
-import type { ConnectionStatus, GlassesStyle, HatStyle, PlayerCosmetic, RoomSnapshot } from '../shared/types.ts';
+import type {
+  ConnectionStatus,
+  GlassesStyle,
+  HatStyle,
+  PlayerCosmetic,
+  RoomSnapshot,
+  SeatStatus,
+} from '../shared/types.ts';
 
 interface LobbyModalProps {
   playerName: string;
@@ -261,13 +268,23 @@ export const LobbyModal: React.FC<LobbyModalProps> = ({
                 const preset = CHARACTER_PRESETS[idx];
                 const zone = PLAYER_ZONES[idx];
                 const isMe = p.id === myPlayerId;
+                const seatStatus: SeatStatus =
+                  roomSnapshot.seats?.[idx] ??
+                  p.seatStatus ??
+                  (p.isBot ? 'BOT' : p.connected ? 'CONNECTED' : 'EMPTY');
+                const isHumanOccupied = seatStatus === 'CONNECTED' || seatStatus === 'RECONNECTING';
+                const isActiveSlot = seatStatus === 'CONNECTED' || seatStatus === 'BOT';
+
                 return (
                   <div
                     key={idx}
+                    data-seat-status={seatStatus}
                     className={`p-3 rounded-2xl border-2 flex flex-col justify-between gap-2 ${
-                      p.connected
-                        ? 'bg-[#17334f] border-[#4d84b8]'
-                        : 'bg-[#0e2033] border-[#233d59] opacity-70'
+                      seatStatus === 'RECONNECTING'
+                        ? 'bg-[#2a2210] border-[#ffd166]/60'
+                        : isActiveSlot
+                          ? 'bg-[#17334f] border-[#4d84b8]'
+                          : 'bg-[#0e2033] border-[#233d59] opacity-70'
                     }`}
                   >
                     <div className="flex items-center justify-between gap-1">
@@ -281,17 +298,21 @@ export const LobbyModal: React.FC<LobbyModalProps> = ({
                     </div>
                     <div>
                       <div className="font-black text-sm truncate">
-                        {p.connected ? p.name : preset.name}
+                        {isHumanOccupied ? p.name : preset.name}
                       </div>
                       <div className="text-xs font-bold mt-0.5">
-                        {!p.connected ? (
+                        {seatStatus === 'EMPTY' ? (
                           <span className="text-slate-400">مقعد فارغ</span>
-                        ) : p.isBot ? (
+                        ) : seatStatus === 'BOT' ? (
                           <span className="text-[#8ac926]">مساعد آلي</span>
+                        ) : seatStatus === 'RECONNECTING' ? (
+                          <span className="text-[#ffd166]">
+                            جاري إعادة الاتصال…{p.ready ? ' (جاهز)' : ' (غير جاهز)'}
+                          </span>
                         ) : p.ready ? (
                           <span className="text-[#06d6a0]">جاهز ✓</span>
                         ) : (
-                          <span className="text-[#ffd166]">ينتظر</span>
+                          <span className="text-[#ffd166]">ينتظر الجاهزية</span>
                         )}
                       </div>
                     </div>
@@ -329,14 +350,32 @@ export const LobbyModal: React.FC<LobbyModalProps> = ({
               {isHost ? (
                 <div className="flex flex-col items-end gap-1.5">
                   {(() => {
-                    const unreadyHumans = roomSnapshot.sim.players.filter(
-                      (p) => p.connected && !p.isBot && !p.ready,
-                    );
+                    const seatEntries = roomSnapshot.sim.players.map((p, idx) => ({
+                      player: p,
+                      status:
+                        roomSnapshot.seats?.[idx] ??
+                        p.seatStatus ??
+                        (p.isBot ? 'BOT' : p.connected ? 'CONNECTED' : 'EMPTY'),
+                    }));
+                    const unreadyHumans = seatEntries
+                      .filter(
+                        ({ player, status }) =>
+                          (status === 'CONNECTED' || status === 'RECONNECTING') && !player.ready,
+                      )
+                      .map(({ player }) => player);
+                    const reconnectingHumans = seatEntries
+                      .filter(({ status }) => status === 'RECONNECTING')
+                      .map(({ player }) => player);
                     return (
                       <>
                         {unreadyHumans.length > 0 && (
                           <span className="text-xs font-bold text-[#ffd166]">
                             بانتظار جاهزية: {unreadyHumans.map((p) => p.name).join('، ')}
+                          </span>
+                        )}
+                        {reconnectingHumans.length > 0 && (
+                          <span className="text-xs font-bold text-[#93c5fd]">
+                            بانتظار عودة: {reconnectingHumans.map((p) => p.name).join('، ')}
                           </span>
                         )}
                         <button

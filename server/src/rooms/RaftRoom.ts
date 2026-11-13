@@ -15,6 +15,7 @@ import {
 import { logServerEvent } from '../lib/logger.ts';
 import { SessionRateLimiter } from '../lib/rateLimit.ts';
 import { isValidRoomCode, normalizeRoomCode } from '../lib/roomCode.ts';
+import { generateResumeToken, hashToken } from '../lib/tokens.ts';
 import { sanitizeCosmeticOrDefault, sanitizePlayerName } from '../lib/validation.ts';
 import { ERROR_MESSAGES_AR, makeErrorPayload, ProtocolError } from '../protocol/errors.ts';
 import {
@@ -98,6 +99,12 @@ function writeSocketAttachment(ws: WebSocket, att: SocketAttachment): void {
   }
 }
 
+interface StoredIdempotentSessionRef {
+  roomCode: string;
+  playerId: string;
+  slot: 0 | 1 | 2 | 3;
+}
+
 export class RaftRoom {
   private ctx: DurableObjectState;
   private sql: SqlStorageAdapter;
@@ -105,6 +112,10 @@ export class RaftRoom {
   private sessions = new SessionManager();
   private rateLimiter = new SessionRateLimiter();
   private sockets = new Map<WebSocket, SocketBinding>();
+  private reservedJoinSlots = new Set<0 | 1 | 2 | 3>();
+  private creatingRoom = false;
+  private inFlightCreates = new Map<string, Promise<void>>();
+  private inFlightJoins = new Map<string, Promise<void>>();
 
   private room: RoomRecord | null = null;
   private loopTimer: ReturnType<typeof setInterval> | null = null;
@@ -210,6 +221,12 @@ export class RaftRoom {
     const url = new URL(request.url);
 
     try {
+      if (url.pathname === '/internal/idem-claim' && request.method === 'POST') {
+        return await this.handleInternalIdemClaim(request);
+      }
+      if (url.pathname === '/internal/idem-release' && request.method === 'POST') {
+        return await this.handleInternalIdemRelease(request);
+      }
       if (url.pathname === '/internal/create' && request.method === 'POST') {
         return await this.handleInternalCreate(request);
       }
@@ -302,26 +319,8 @@ export class RaftRoom {
     const nowMs = Date.now();
     this.persistence.pruneExpiredRequests(nowMs);
 
-    const expiredIds = this.sessions.expireGraceSessions(this.room, nowMs);
-    if (expiredIds.length > 0) {
-      for (const id of expiredIds) {
-        this.persistence.deleteSession(id);
-        this.room.sessions.delete(id);
-        this.rateLimiter.clear(id);
-        logServerEvent('player_expired', {
-          roomCode: this.room.roomCode,
-          playerId: id,
-        });
-      }
-      const hostRes = reconcileHostLeadership(this.room, nowMs);
-      if (hostRes.hostChanged) {
-        logServerEvent('host_migrated', {
-          roomCode: this.room.roomCode,
-          newHostId: hostRes.newHostId,
-        });
-      }
-      syncBotsInRoom(this.room, nowMs);
-      updateRoomEmptyState(this.room, nowMs);
+    const expiredChanged = this.cleanupExpiredSessions(this.room, nowMs);
+    if (expiredChanged) {
       const snapshot = issueNextRoomSnapshot(this.room, nowMs);
       this.persistence.saveAll(this.room, nowMs);
       this.broadcastMsg(makeRoomStateMsg(snapshot));
@@ -370,6 +369,111 @@ export class RaftRoom {
     return binding;
   }
 
+  private cleanupExpiredSessions(room: RoomRecord, nowMs: number): boolean {
+    const expiredIds = this.sessions.expireGraceSessions(room, nowMs);
+    if (expiredIds.length === 0) {
+      return false;
+    }
+
+    for (const id of expiredIds) {
+      this.persistence.deleteSession(id);
+      room.sessions.delete(id);
+      this.rateLimiter.clear(id);
+      logServerEvent('player_expired', {
+        roomCode: room.roomCode,
+        playerId: id,
+      });
+    }
+
+    const hostRes = reconcileHostLeadership(room, nowMs);
+    if (hostRes.hostChanged) {
+      logServerEvent('host_migrated', {
+        roomCode: room.roomCode,
+        newHostId: hostRes.newHostId,
+      });
+    }
+
+    syncBotsInRoom(room, nowMs);
+    updateRoomEmptyState(room, nowMs);
+    return true;
+  }
+
+  private async buildIdempotentCredentialReplay(
+    room: RoomRecord,
+    ref: StoredIdempotentSessionRef,
+    nowMs: number,
+  ): Promise<RoomSessionCredentials | null> {
+    const session = room.sessions.get(ref.playerId);
+    if (!session || session.revoked || nowMs >= session.expiresAt) {
+      return null;
+    }
+
+    let resumeToken = '';
+    // Re-issue a fresh one-time resumeToken only while the session has not completed initial WS activation.
+    // Never store plaintext resumeToken in room_requests.
+    if (!session.connected && session.connectionEpoch === 1) {
+      resumeToken = generateResumeToken();
+      session.resumeTokenHash = await hashToken(resumeToken);
+      this.persistence.saveSession(session);
+    }
+
+    const snapshot = issueNextRoomSnapshot(room, nowMs);
+    return {
+      roomCode: room.roomCode,
+      playerId: session.playerId,
+      resumeToken,
+      sessionId: session.sessionId,
+      connectionEpoch: session.connectionEpoch,
+      role: session.role,
+      slot: session.slot,
+      snapshot,
+    };
+  }
+
+  private async handleInternalIdemClaim(request: Request): Promise<Response> {
+    const body = (await request.json()) as { keyHash?: string; candidateRoomCode?: string };
+    const keyHash = typeof body.keyHash === 'string' ? body.keyHash.trim() : '';
+    const candidateRoomCode = normalizeRoomCode(body.candidateRoomCode ?? '');
+    if (!keyHash || !isValidRoomCode(candidateRoomCode)) {
+      throw new ProtocolError('INVALID_MESSAGE', undefined, 400);
+    }
+
+    const nowMs = Date.now();
+    this.persistence.pruneExpiredRequests(nowMs);
+    const reqKey = `create_map:${keyHash}`;
+    const existing = this.persistence.getRequestRecord<{ roomCode: string }>(reqKey, nowMs);
+    if (existing && isValidRoomCode(existing.roomCode)) {
+      return jsonResponse({ roomCode: existing.roomCode, claimed: false }, 200);
+    }
+
+    this.persistence.saveRequestRecord(
+      reqKey,
+      'IDEM_INDEX',
+      'create_map',
+      { roomCode: candidateRoomCode },
+      24 * 60 * 60 * 1000,
+      nowMs,
+    );
+    return jsonResponse({ roomCode: candidateRoomCode, claimed: true }, 200);
+  }
+
+  private async handleInternalIdemRelease(request: Request): Promise<Response> {
+    const body = (await request.json()) as { keyHash?: string; candidateRoomCode?: string };
+    const keyHash = typeof body.keyHash === 'string' ? body.keyHash.trim() : '';
+    const candidateRoomCode = normalizeRoomCode(body.candidateRoomCode ?? '');
+    if (!keyHash || !isValidRoomCode(candidateRoomCode)) {
+      return jsonResponse({ released: false }, 200);
+    }
+
+    const reqKey = `create_map:${keyHash}`;
+    const existing = this.persistence.getRequestRecord<{ roomCode: string }>(reqKey);
+    if (existing && existing.roomCode === candidateRoomCode) {
+      this.sql.exec(`DELETE FROM room_requests WHERE request_key = ?`, reqKey);
+      return jsonResponse({ released: true }, 200);
+    }
+    return jsonResponse({ released: false }, 200);
+  }
+
   private async handleInternalCreate(request: Request): Promise<Response> {
     const body = (await request.json()) as CreateRoomHttpRequest & { roomCode: string };
     const roomCode = normalizeRoomCode(body.roomCode ?? '');
@@ -383,133 +487,263 @@ export class RaftRoom {
         ? body.idempotencyKey.trim().slice(0, 128)
         : null;
 
+    if (idempotencyKey) {
+      const inFlight = this.inFlightCreates.get(idempotencyKey);
+      if (inFlight) {
+        await inFlight;
+      }
+      const existingRef = this.persistence.getRequestRecord<StoredIdempotentSessionRef>(
+        `idem:create:${idempotencyKey}`,
+        nowMs,
+      );
+      if (existingRef && this.room && this.room.lifecycleState !== 'CLOSED') {
+        const replayed = await this.buildIdempotentCredentialReplay(this.room, existingRef, nowMs);
+        if (replayed) {
+          return jsonResponse(replayed, 200);
+        }
+      }
+    }
+
     if (this.room && shouldCloseAbandonedRoom(this.room, nowMs)) {
       await this.closeAndPurgeRoom();
     }
 
-    if (this.room && this.room.lifecycleState !== 'CLOSED') {
+    if (this.creatingRoom || (this.room && this.room.lifecycleState !== 'CLOSED')) {
       throw new ProtocolError('ROOM_ALREADY_EXISTS', undefined, 409);
     }
 
-    const hostName = sanitizePlayerName(body.name, 'قبطان');
-    const hostCosmetic = sanitizeCosmeticOrDefault(body.cosmetic, 0);
+    this.creatingRoom = true;
+    let resolveInFlight: (() => void) | undefined;
+    if (idempotencyKey) {
+      const p = new Promise<void>((r) => {
+        resolveInFlight = r;
+      });
+      this.inFlightCreates.set(idempotencyKey, p);
+    }
 
-    const sim = createInitialSimState('online', hostName, hostCosmetic);
-    sim.phase = 'waiting';
+    try {
+      const hostName = sanitizePlayerName(body.name, 'قبطان');
+      const hostCosmetic = sanitizeCosmeticOrDefault(body.cosmetic, 0);
 
-    const room: RoomRecord = {
-      roomCode,
-      lifecycleState: 'CREATING',
-      hostId: '',
-      fillBots: true,
-      idempotencyKey,
-      createdAt: nowMs,
-      updatedAt: nowMs,
-      expiresAt: nowMs + ROOM_MAX_TTL_MS,
-      emptySinceMs: nowMs,
-      snapshotSeq: 1,
-      accumulatorSec: 0,
-      lastPersistedAtMs: nowMs,
-      sim,
-      recentEvents: [],
-      sessions: new Map(),
-    };
+      const sim = createInitialSimState('online', hostName, hostCosmetic);
+      sim.phase = 'waiting';
 
-    const issued = await this.sessions.createSession({
-      roomCode,
-      slot: 0,
-      role: 'HOST',
-      name: hostName,
-      cosmetic: hostCosmetic,
-      nowMs,
-    });
+      const room: RoomRecord = {
+        roomCode,
+        lifecycleState: 'CREATING',
+        hostId: '',
+        fillBots: true,
+        idempotencyKey,
+        createdAt: nowMs,
+        updatedAt: nowMs,
+        expiresAt: nowMs + ROOM_MAX_TTL_MS,
+        emptySinceMs: nowMs,
+        snapshotSeq: 1,
+        accumulatorSec: 0,
+        lastPersistedAtMs: nowMs,
+        sim,
+        recentEvents: [],
+        sessions: new Map(),
+      };
 
-    room.hostId = issued.session.playerId;
-    room.sessions.set(issued.session.playerId, issued.session);
-    room.sim.players[0].id = issued.session.playerId;
-    room.sim.players[0].connected = false;
-    room.sim.players[0].ready = true;
+      const issued = await this.sessions.createSession({
+        roomCode,
+        slot: 0,
+        role: 'HOST',
+        name: hostName,
+        cosmetic: hostCosmetic,
+        nowMs,
+      });
 
-    syncBotsInRoom(room, nowMs);
-    transitionRoomLifecycle(room, 'WAITING');
+      room.hostId = issued.session.playerId;
+      room.sessions.set(issued.session.playerId, issued.session);
+      room.sim.players[0].id = issued.session.playerId;
+      room.sim.players[0].connected = false;
+      room.sim.players[0].ready = true;
 
-    this.room = room;
-    this.isClosing = false;
-    const snapshot = issueNextRoomSnapshot(room, nowMs);
-    this.persistence.saveAll(room, nowMs);
-    await this.scheduleNextAlarm(nowMs);
+      syncBotsInRoom(room, nowMs);
+      transitionRoomLifecycle(room, 'WAITING');
 
-    logServerEvent('room_created', {
-      roomCode,
-      hostId: issued.session.playerId,
-    });
+      this.room = room;
+      this.isClosing = false;
+      const snapshot = issueNextRoomSnapshot(room, nowMs);
+      this.persistence.saveAll(room, nowMs);
+      if (idempotencyKey) {
+        const ref: StoredIdempotentSessionRef = {
+          roomCode,
+          playerId: issued.session.playerId,
+          slot: issued.session.slot,
+        };
+        this.persistence.saveRequestRecord(
+          `idem:create:${idempotencyKey}`,
+          roomCode,
+          'room:create',
+          ref,
+          ROOM_MAX_TTL_MS,
+          nowMs,
+        );
+      }
+      await this.scheduleNextAlarm(nowMs);
 
-    const creds: RoomSessionCredentials = {
-      roomCode,
-      playerId: issued.session.playerId,
-      resumeToken: issued.resumeToken,
-      sessionId: issued.session.sessionId,
-      connectionEpoch: issued.session.connectionEpoch,
-      role: issued.session.role,
-      slot: issued.session.slot,
-      snapshot,
-    };
-    return jsonResponse(creds, 201);
+      logServerEvent('room_created', {
+        roomCode,
+        hostId: issued.session.playerId,
+      });
+
+      const creds: RoomSessionCredentials = {
+        roomCode,
+        playerId: issued.session.playerId,
+        resumeToken: issued.resumeToken,
+        sessionId: issued.session.sessionId,
+        connectionEpoch: issued.session.connectionEpoch,
+        role: issued.session.role,
+        slot: issued.session.slot,
+        snapshot,
+      };
+      return jsonResponse(creds, 201);
+    } finally {
+      this.creatingRoom = false;
+      if (idempotencyKey) {
+        this.inFlightCreates.delete(idempotencyKey);
+        resolveInFlight?.();
+      }
+    }
   }
 
   private async handleInternalJoin(request: Request): Promise<Response> {
     const room = this.requireActiveRoom();
     const nowMs = Date.now();
+    const body = (await request.json()) as JoinRoomHttpRequest;
+    const idempotencyKey =
+      typeof body.idempotencyKey === 'string' && body.idempotencyKey.trim().length > 0
+        ? body.idempotencyKey.trim().slice(0, 128)
+        : null;
 
-    const expiredIds = this.sessions.expireGraceSessions(room, nowMs);
-    for (const id of expiredIds) {
-      this.persistence.deleteSession(id);
-      room.sessions.delete(id);
+    const expiredChanged = this.cleanupExpiredSessions(room, nowMs);
+    if (expiredChanged) {
+      this.persistence.saveAll(room, nowMs);
     }
 
-    const body = (await request.json()) as JoinRoomHttpRequest;
-    const openSlot = findAvailableSeatSlot(room, nowMs);
+    if (idempotencyKey) {
+      const inFlight = this.inFlightJoins.get(idempotencyKey);
+      if (inFlight) {
+        await inFlight;
+      }
+      const existingRef = this.persistence.getRequestRecord<StoredIdempotentSessionRef>(
+        `idem:join:${idempotencyKey}`,
+        nowMs,
+      );
+      if (existingRef) {
+        const replayed = await this.buildIdempotentCredentialReplay(room, existingRef, nowMs);
+        if (replayed) {
+          if (expiredChanged) {
+            this.broadcastMsg(makeRoomStateMsg(replayed.snapshot));
+          }
+          return jsonResponse(replayed, 200);
+        }
+      }
+    }
+
+    // Reserve seat synchronously BEFORE any await so concurrent join requests cannot claim the same slot
+    const openSlot = findAvailableSeatSlot(room, nowMs, this.reservedJoinSlots);
     if (openSlot === null) {
+      if (expiredChanged) {
+        const snap = issueNextRoomSnapshot(room, nowMs);
+        this.broadcastMsg(makeRoomStateMsg(snap));
+      }
       throw new ProtocolError('ROOM_FULL', undefined, 409);
     }
 
-    const cleanName = sanitizePlayerName(body.name, `لاعب ${openSlot + 1}`);
-    const cleanCosmetic = sanitizeCosmeticOrDefault(body.cosmetic, openSlot);
+    this.reservedJoinSlots.add(openSlot);
+    let resolveInFlight: (() => void) | undefined;
+    if (idempotencyKey) {
+      const p = new Promise<void>((r) => {
+        resolveInFlight = r;
+      });
+      this.inFlightJoins.set(idempotencyKey, p);
+    }
 
-    const issued = await this.sessions.createSession({
-      roomCode: room.roomCode,
-      slot: openSlot,
-      role: 'PLAYER',
-      name: cleanName,
-      cosmetic: cleanCosmetic,
-      nowMs,
-    });
+    try {
+      const cleanName = sanitizePlayerName(body.name, `لاعب ${openSlot + 1}`);
+      const cleanCosmetic = sanitizeCosmeticOrDefault(body.cosmetic, openSlot);
 
-    room.sessions.set(issued.session.playerId, issued.session);
-    syncBotsInRoom(room, nowMs);
-    const snapshot = issueNextRoomSnapshot(room, nowMs);
-    this.persistence.saveAll(room, nowMs);
-    await this.scheduleNextAlarm(nowMs);
+      const currentHost = room.sessions.get(room.hostId);
+      const hasValidHost = Boolean(currentHost && !currentHost.revoked);
+      const assignedRole = hasValidHost ? 'PLAYER' : 'HOST';
 
-    logServerEvent('player_joined', {
-      roomCode: room.roomCode,
-      playerId: issued.session.playerId,
-      slot: issued.session.slot,
-    });
+      const issued = await this.sessions.createSession({
+        roomCode: room.roomCode,
+        slot: openSlot,
+        role: assignedRole,
+        name: cleanName,
+        cosmetic: cleanCosmetic,
+        nowMs,
+      });
 
-    this.broadcastMsg(makeRoomStateMsg(snapshot));
+      if (this.isClosing || this.room !== room || room.lifecycleState === 'CLOSED') {
+        throw new ProtocolError('ROOM_CLOSED', undefined, 410);
+      }
 
-    const creds: RoomSessionCredentials = {
-      roomCode: room.roomCode,
-      playerId: issued.session.playerId,
-      resumeToken: issued.resumeToken,
-      sessionId: issued.session.sessionId,
-      connectionEpoch: issued.session.connectionEpoch,
-      role: issued.session.role,
-      slot: issued.session.slot,
-      snapshot,
-    };
-    return jsonResponse(creds, 200);
+      room.sessions.set(issued.session.playerId, issued.session);
+      if (assignedRole === 'HOST') {
+        room.hostId = issued.session.playerId;
+      }
+
+      const hostRes = reconcileHostLeadership(room, nowMs);
+      if (hostRes.hostChanged) {
+        logServerEvent('host_migrated', {
+          roomCode: room.roomCode,
+          newHostId: hostRes.newHostId,
+        });
+      }
+
+      syncBotsInRoom(room, nowMs);
+      updateRoomEmptyState(room, nowMs);
+      const snapshot = issueNextRoomSnapshot(room, nowMs);
+      this.persistence.saveAll(room, nowMs);
+      if (idempotencyKey) {
+        const ref: StoredIdempotentSessionRef = {
+          roomCode: room.roomCode,
+          playerId: issued.session.playerId,
+          slot: issued.session.slot,
+        };
+        this.persistence.saveRequestRecord(
+          `idem:join:${idempotencyKey}`,
+          room.roomCode,
+          'room:join',
+          ref,
+          ROOM_MAX_TTL_MS,
+          nowMs,
+        );
+      }
+      await this.scheduleNextAlarm(nowMs);
+
+      logServerEvent('player_joined', {
+        roomCode: room.roomCode,
+        playerId: issued.session.playerId,
+        slot: issued.session.slot,
+      });
+
+      this.broadcastMsg(makeRoomStateMsg(snapshot));
+
+      const creds: RoomSessionCredentials = {
+        roomCode: room.roomCode,
+        playerId: issued.session.playerId,
+        resumeToken: issued.resumeToken,
+        sessionId: issued.session.sessionId,
+        connectionEpoch: issued.session.connectionEpoch,
+        role: issued.session.role,
+        slot: issued.session.slot,
+        snapshot,
+      };
+      return jsonResponse(creds, 200);
+    } finally {
+      this.reservedJoinSlots.delete(openSlot);
+      if (idempotencyKey) {
+        this.inFlightJoins.delete(idempotencyKey);
+        resolveInFlight?.();
+      }
+    }
   }
 
   private handleInternalInfo(): Response {
@@ -649,23 +883,7 @@ export class RaftRoom {
     const rawDt = (nowMs - this.lastTickMs) / 1000;
     this.lastTickMs = nowMs;
 
-    const expiredIds = this.sessions.expireGraceSessions(room, nowMs);
-    let metaDirty = false;
-    if (expiredIds.length > 0) {
-      for (const id of expiredIds) {
-        this.persistence.deleteSession(id);
-        room.sessions.delete(id);
-        this.rateLimiter.clear(id);
-        logServerEvent('player_expired', { roomCode: room.roomCode, playerId: id });
-      }
-      const hostRes = reconcileHostLeadership(room, nowMs);
-      if (hostRes.hostChanged) {
-        logServerEvent('host_migrated', { roomCode: room.roomCode, newHostId: hostRes.newHostId });
-      }
-      syncBotsInRoom(room, nowMs);
-      updateRoomEmptyState(room, nowMs);
-      metaDirty = true;
-    }
+    const metaDirty = this.cleanupExpiredSessions(room, nowMs);
 
     if (shouldCloseAbandonedRoom(room, nowMs)) {
       void this.closeAndPurgeRoom();

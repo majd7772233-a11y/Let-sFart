@@ -136,8 +136,23 @@ export default function App() {
       onEvents: (events) => {
         sceneRef.current?.processDiscreteEvents(events);
       },
-      onError: (msg) => {
+      onError: (msg, code) => {
         setLobbyError(msg);
+        if (
+          code === 'SESSION_REPLACED' ||
+          code === 'SESSION_EXPIRED' ||
+          code === 'UNAUTHORIZED' ||
+          code === 'ROOM_NOT_FOUND' ||
+          code === 'ROOM_CLOSED' ||
+          code === 'FORBIDDEN_ORIGIN'
+        ) {
+          setRoomSnapshot(null);
+          setMyPlayerId(null);
+          if (screenRef.current === 'playing' || screenRef.current === 'paused') {
+            setScreen('lobby');
+            sceneRef.current?.setScreenState('lobby');
+          }
+        }
       },
       onConnectionChange: (status) => {
         setConnectionStatus(status);

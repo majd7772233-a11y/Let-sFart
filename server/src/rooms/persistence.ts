@@ -2,6 +2,7 @@ import type {
   PlayerCosmetic,
   PlayerRole,
   RoomLifecycleState,
+  SimEvent,
   WorldSimulationState,
 } from '../../../src/shared/types.ts';
 import {
@@ -28,6 +29,7 @@ interface RoomMetaRow {
 interface RoomStateRow {
   room_code: string;
   sim_json: string;
+  recent_events_json?: string;
   snapshot_seq: number;
   last_event_seq: number;
   saved_at: number;
@@ -87,6 +89,60 @@ function isValidRestoredSim(sim: unknown): sim is WorldSimulationState {
   return true;
 }
 
+const VALID_EVENT_TYPES = new Set<SimEvent['type']>([
+  'collision',
+  'bumper',
+  'checkpoint',
+  'fall',
+  'finish',
+  'fart_start',
+  'fart_stop',
+]);
+
+function parseRestoredEvents(rawJson: string | undefined, fallbackSimEvents: unknown): SimEvent[] {
+  let candidate: unknown = null;
+  if (typeof rawJson === 'string' && rawJson.length > 0) {
+    try {
+      candidate = JSON.parse(rawJson);
+    } catch {
+      candidate = null;
+    }
+  }
+  if (!Array.isArray(candidate) && Array.isArray(fallbackSimEvents)) {
+    candidate = fallbackSimEvents;
+  }
+  if (!Array.isArray(candidate)) return [];
+
+  const valid: SimEvent[] = [];
+  for (const item of candidate) {
+    if (!item || typeof item !== 'object') continue;
+    const ev = item as Partial<SimEvent>;
+    if (
+      typeof ev.id === 'number' &&
+      Number.isInteger(ev.id) &&
+      ev.id > 0 &&
+      typeof ev.type === 'string' &&
+      VALID_EVENT_TYPES.has(ev.type as SimEvent['type']) &&
+      typeof ev.intensity === 'number' &&
+      Number.isFinite(ev.intensity) &&
+      typeof ev.x === 'number' &&
+      Number.isFinite(ev.x) &&
+      typeof ev.z === 'number' &&
+      Number.isFinite(ev.z)
+    ) {
+      valid.push({
+        id: ev.id,
+        type: ev.type as SimEvent['type'],
+        ...(typeof ev.slot === 'number' ? { slot: ev.slot } : {}),
+        intensity: ev.intensity,
+        x: ev.x,
+        z: ev.z,
+      });
+    }
+  }
+  return valid.slice(-32);
+}
+
 export class RoomPersistence {
   private sql: SqlStorageAdapter;
 
@@ -123,7 +179,7 @@ export class RoomPersistence {
 
     const stateRows = this.sql
       .exec<RoomStateRow>(
-        `SELECT room_code, sim_json, snapshot_seq, last_event_seq, saved_at
+        `SELECT room_code, sim_json, recent_events_json, snapshot_seq, last_event_seq, saved_at
          FROM room_state
          WHERE room_code = ?
          LIMIT 1`,
@@ -200,6 +256,14 @@ export class RoomPersistence {
       }
     }
 
+    const recentEvents = parseRestoredEvents(stateRows[0].recent_events_json, sim.events);
+    const maxRestoredEventId = recentEvents.reduce((max, ev) => (ev.id > max ? ev.id : max), 0);
+    sim.eventSeq = Math.max(
+      typeof sim.eventSeq === 'number' && Number.isFinite(sim.eventSeq) ? sim.eventSeq : 0,
+      stateRows[0].last_event_seq || 0,
+      maxRestoredEventId,
+    );
+
     return {
       roomCode: row.room_code,
       lifecycleState: row.lifecycle_state as RoomLifecycleState,
@@ -214,7 +278,7 @@ export class RoomPersistence {
       accumulatorSec: 0,
       lastPersistedAtMs: stateRows[0].saved_at,
       sim,
-      recentEvents: Array.isArray(sim.events) ? sim.events.slice(-32) : [],
+      recentEvents,
       sessions,
     };
   }
@@ -251,17 +315,20 @@ export class RoomPersistence {
 
   public saveSimState(room: RoomRecord, nowMs = Date.now()): void {
     room.lastPersistedAtMs = nowMs;
+    const boundedEvents = room.recentEvents.slice(-32);
     this.sql.exec(
       `INSERT INTO room_state (
-        room_code, sim_json, snapshot_seq, last_event_seq, saved_at
-      ) VALUES (?, ?, ?, ?, ?)
+        room_code, sim_json, recent_events_json, snapshot_seq, last_event_seq, saved_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT(room_code) DO UPDATE SET
         sim_json = excluded.sim_json,
+        recent_events_json = excluded.recent_events_json,
         snapshot_seq = excluded.snapshot_seq,
         last_event_seq = excluded.last_event_seq,
         saved_at = excluded.saved_at`,
       room.roomCode,
       JSON.stringify(room.sim),
+      JSON.stringify(boundedEvents),
       room.snapshotSeq,
       room.sim.eventSeq,
       nowMs,

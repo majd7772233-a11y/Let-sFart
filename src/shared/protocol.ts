@@ -50,6 +50,7 @@ export interface CreateRoomHttpRequest {
 export interface JoinRoomHttpRequest {
   name: string;
   cosmetic: PlayerCosmetic;
+  idempotencyKey?: string;
 }
 
 export interface RoomSessionCredentials {
