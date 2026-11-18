@@ -27,6 +27,7 @@ import {
   recordOpsEventInD1,
   recordVerifiedMatchInD1,
   saveRoundReplayInD1,
+  syncAccountMirrorInD1,
 } from './db/d1Store.ts';
 import { isOriginAllowed, resolveCorsAllowOrigin, type Env } from './env.ts';
 import { logServerEvent } from './lib/logger.ts';
@@ -86,6 +87,35 @@ async function checkPersistentEdgeRateLimit(
     return false;
   }
   return true;
+}
+
+async function syncAccountMirrorFromResponse(env: Env, doRes: Response): Promise<void> {
+  if (!env.DB || !doRes.ok) return;
+  try {
+    const body = (await doRes.clone().json()) as {
+      profile?: {
+        accountId?: string;
+        username?: string | null;
+        displayName?: string;
+        level?: number;
+        xp?: number;
+      };
+      stats?: { wins?: number };
+    };
+    const p = body.profile;
+    if (p?.accountId && typeof p.displayName === 'string') {
+      await syncAccountMirrorInD1(env.DB, {
+        accountId: p.accountId,
+        username: p.username ?? null,
+        displayName: p.displayName,
+        level: Number(p.level ?? 1),
+        xp: Number(p.xp ?? 0),
+        wins: Number(body.stats?.wins ?? 0),
+      });
+    }
+  } catch {
+    // Non-fatal mirror sync
+  }
 }
 
 function withCors(res: Response, request: Request, env: Env): Response {
@@ -436,6 +466,7 @@ async function handleWorkerRouteInner(request: Request, env: Env): Promise<Respo
         return jsonResp({ error: makeErrorPayload('RATE_LIMITED') }, 429, request, env);
       }
       const doRes = await forwardProgressionRequest(env, '/internal/prog/guest', request);
+      await syncAccountMirrorFromResponse(env, doRes);
       return withCors(doRes, request, env);
     }
 
@@ -447,6 +478,7 @@ async function handleWorkerRouteInner(request: Request, env: Env): Promise<Respo
         return jsonResp({ error: makeErrorPayload('RATE_LIMITED') }, 429, request, env);
       }
       const doRes = await forwardProgressionRequest(env, '/internal/prog/register', request);
+      await syncAccountMirrorFromResponse(env, doRes);
       return withCors(doRes, request, env);
     }
 
@@ -458,6 +490,7 @@ async function handleWorkerRouteInner(request: Request, env: Env): Promise<Respo
         return jsonResp({ error: makeErrorPayload('RATE_LIMITED') }, 429, request, env);
       }
       const doRes = await forwardProgressionRequest(env, '/internal/prog/login', request);
+      await syncAccountMirrorFromResponse(env, doRes);
       return withCors(doRes, request, env);
     }
 
@@ -466,6 +499,7 @@ async function handleWorkerRouteInner(request: Request, env: Env): Promise<Respo
         return jsonResp({ error: makeErrorPayload('RATE_LIMITED') }, 429, request, env);
       }
       const doRes = await forwardProgressionRequest(env, '/internal/prog/link', request);
+      await syncAccountMirrorFromResponse(env, doRes);
       return withCors(doRes, request, env);
     }
 
@@ -594,6 +628,7 @@ async function handleWorkerRouteInner(request: Request, env: Env): Promise<Respo
             };
             await recordVerifiedMatchInD1(env.DB, verified);
           }
+          await syncAccountMirrorFromResponse(env, doRes);
         } catch {
           // Best-effort D1 mirror
         }

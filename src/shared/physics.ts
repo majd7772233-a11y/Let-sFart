@@ -516,6 +516,7 @@ export function createInitialSimState(
     pickups: createInitialPickups(course, resolved.enableItems),
     raftHp: 100,
     maxHp: 100,
+    boatDamageEnabled: true,
     shieldHits: 0,
     shieldTimer: 0,
     magnetTimer: 0,
@@ -646,7 +647,7 @@ export function respawnAtCheckpoint(
     }
   }
 
-  state.raftHp = Math.max(state.raftHp ?? 0, 75);
+  state.raftHp = state.maxHp;
   state.anchorActive = false;
   state.activeHazardTag = null;
   state.phase = 'playing';
@@ -768,13 +769,16 @@ function applyHullDamage(
   x: number,
   z: number,
 ): 'blocked' | 'damaged' | 'sunk' {
+  if (state.boatDamageEnabled === false) {
+    return 'blocked';
+  }
   const diffScale =
-    state.difficulty === 'easy' ? 0.7 : state.difficulty === 'hard' ? 1.4 : 1.0;
+    state.difficulty === 'easy' ? 0.55 : state.difficulty === 'hard' ? 1.05 : 0.78;
   const survScale =
     state.gameMode === 'survival'
-      ? Math.min(1.55, 1 + Math.max(0, (state.survivalSpeedScale ?? 1) - 1) * 0.45)
+      ? Math.min(1.4, 1 + Math.max(0, (state.survivalSpeedScale ?? 1) - 1) * 0.35)
       : 1.0;
-  const scaledDamage = Math.round(rawDamage * diffScale * survScale);
+  const scaledDamage = Math.max(1, Math.round(rawDamage * diffScale * survScale * 0.72));
 
   if (state.invulnTimer > 0 || scaledDamage <= 0) return 'blocked';
   if (state.shieldHits > 0 && state.shieldTimer > 0) {
@@ -796,11 +800,12 @@ function applyHullDamage(
         z,
       });
     }
-    state.invulnTimer = Math.max(state.invulnTimer, 0.45);
+    state.invulnTimer = Math.max(state.invulnTimer, 0.55);
     return 'blocked';
   }
 
   const prevHp = state.raftHp;
+  state.invulnTimer = Math.max(state.invulnTimer, 0.55);
   if (state.practiceMode) {
     state.raftHp = Math.max(45, state.raftHp - scaledDamage);
     state.minRaftHp = Math.min(state.minRaftHp ?? 100, state.raftHp);

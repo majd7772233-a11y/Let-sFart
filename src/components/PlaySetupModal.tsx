@@ -7,10 +7,12 @@ interface PlaySetupModalProps {
   selectedGameMode: GameMode;
   selectedDifficulty: GameDifficulty;
   selectedBotDifficulty: BotDifficulty;
+  boatDamageEnabled: boolean;
   onSelectCourse: (courseId: CourseId) => void;
   onSelectGameMode: (mode: GameMode) => void;
   onSelectDifficulty: (difficulty: GameDifficulty) => void;
   onSelectBotDifficulty: (botDifficulty: BotDifficulty) => void;
+  onToggleBoatDamage: (enabled: boolean) => void;
   onStartSolo: () => void;
   onStartTutorial?: () => void;
   onStartPractice?: () => void;
@@ -67,10 +69,12 @@ export const PlaySetupModal: React.FC<PlaySetupModalProps> = ({
   selectedGameMode,
   selectedDifficulty,
   selectedBotDifficulty,
+  boatDamageEnabled,
   onSelectCourse,
   onSelectGameMode,
   onSelectDifficulty,
   onSelectBotDifficulty,
+  onToggleBoatDamage,
   onStartSolo,
   onStartTutorial,
   onStartPractice,
@@ -262,6 +266,39 @@ export const PlaySetupModal: React.FC<PlaySetupModalProps> = ({
                   );
                 })}
               </div>
+            </div>
+          </section>
+
+          {/* 4. Boat Damage Toggle */}
+          <section className="space-y-2">
+            <h3 className="text-sm sm:text-base font-black text-[#fff8e7]">4. ضرر القارب (سلامة الطوف)</h3>
+            <div className="grid grid-cols-2 gap-1.5 bg-[#0f2236] border border-[#234363] rounded-xl p-1">
+              <button
+                type="button"
+                data-testid="boat-damage-on-btn"
+                aria-pressed={boatDamageEnabled}
+                onClick={() => onToggleBoatDamage(true)}
+                className={`min-h-[40px] rounded-lg text-xs sm:text-sm font-black cursor-pointer transition-colors ${
+                  boatDamageEnabled
+                    ? 'bg-[#ffd13b] text-[#14222f]'
+                    : 'text-[#cbd5e1] hover:text-white hover:bg-[#132940]'
+                }`}
+              >
+                🛡️ مفعّل (قياسي)
+              </button>
+              <button
+                type="button"
+                data-testid="boat-damage-off-btn"
+                aria-pressed={!boatDamageEnabled}
+                onClick={() => onToggleBoatDamage(false)}
+                className={`min-h-[40px] rounded-lg text-xs sm:text-sm font-black cursor-pointer transition-colors ${
+                  !boatDamageEnabled
+                    ? 'bg-[#06d6a0] text-[#06281e]'
+                    : 'text-[#cbd5e1] hover:text-white hover:bg-[#132940]'
+                }`}
+              >
+                ✨ بدون ضرر (لا يتضرر)
+              </button>
             </div>
           </section>
 

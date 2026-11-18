@@ -16,6 +16,7 @@ interface TitleScreenProps {
   selectedGameMode: GameMode;
   selectedDifficulty: GameDifficulty;
   selectedBotDifficulty?: BotDifficulty;
+  boatDamageEnabled?: boolean;
   accountProfile?: AccountProfile | null;
   claimableRewardsCount?: number;
   rareEvent?: RareEventState | null;
@@ -23,6 +24,7 @@ interface TitleScreenProps {
   onSelectGameMode: (mode: GameMode) => void;
   onSelectDifficulty: (difficulty: GameDifficulty) => void;
   onSelectBotDifficulty?: (botDifficulty: BotDifficulty) => void;
+  onToggleBoatDamage?: (enabled: boolean) => void;
   onStartSolo: () => void;
   onStartTutorial?: () => void;
   onStartPractice?: () => void;
@@ -51,6 +53,7 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
   selectedGameMode,
   selectedDifficulty,
   selectedBotDifficulty = 'normal',
+  boatDamageEnabled = true,
   accountProfile = null,
   claimableRewardsCount = 0,
   rareEvent = null,
@@ -58,6 +61,7 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
   onSelectGameMode,
   onSelectDifficulty,
   onSelectBotDifficulty,
+  onToggleBoatDamage,
   onStartSolo,
   onStartTutorial,
   onStartPractice,
@@ -274,10 +278,12 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
           selectedGameMode={selectedGameMode}
           selectedDifficulty={selectedDifficulty}
           selectedBotDifficulty={selectedBotDifficulty}
+          boatDamageEnabled={boatDamageEnabled}
           onSelectCourse={onSelectCourse}
           onSelectGameMode={onSelectGameMode}
           onSelectDifficulty={onSelectDifficulty}
           onSelectBotDifficulty={(d) => onSelectBotDifficulty?.(d)}
+          onToggleBoatDamage={(enabled) => onToggleBoatDamage?.(enabled)}
           onStartSolo={onStartSolo}
           onStartTutorial={onStartTutorial}
           onStartPractice={onStartPractice}

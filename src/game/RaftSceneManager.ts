@@ -581,7 +581,7 @@ export class RaftSceneManager {
     cosmetic: PlayerCosmetic,
     fromUserGesture = true,
     courseId?: CourseId,
-    settings?: Partial<RoomSettings>,
+    settings?: Partial<RoomSettings> & { boatDamageEnabled?: boolean },
     accountMeta?: { accountId?: string; playerLevel?: number },
   ): void {
     if (fromUserGesture) {
@@ -615,6 +615,7 @@ export class RaftSceneManager {
     this.activeBestSurvival = loadSurvivalBest(targetCourse);
 
     this.sim = createInitialSimState('solo', playerName, cosmetic, targetCourse, settings);
+    this.sim.boatDamageEnabled = settings?.boatDamageEnabled ?? true;
     if (accountMeta?.accountId) {
       this.sim.players[0].accountId = accountMeta.accountId;
     }

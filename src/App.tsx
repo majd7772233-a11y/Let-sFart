@@ -488,6 +488,10 @@ export default function App() {
     [ensureAccountReady],
   );
 
+  const [boatDamageEnabled, setBoatDamageEnabled] = useState<boolean>(true);
+  const boatDamageEnabledRef = useRef<boolean>(true);
+  boatDamageEnabledRef.current = boatDamageEnabled;
+
   const handleStartSolo = useCallback(() => {
     const active = document.activeElement as HTMLElement | null;
     active?.blur?.();
@@ -512,6 +516,7 @@ export default function App() {
         gameMode: selectedGameModeRef.current,
         difficulty: selectedDifficultyRef.current,
         botDifficulty: selectedBotDifficultyRef.current,
+        boatDamageEnabled: boatDamageEnabledRef.current,
       },
       prof ? { accountId: prof.accountId, playerLevel: prof.level } : undefined,
     );
@@ -585,6 +590,7 @@ export default function App() {
           gameMode: selectedGameModeRef.current,
           difficulty: selectedDifficultyRef.current,
           botDifficulty: selectedBotDifficultyRef.current,
+          boatDamageEnabled: boatDamageEnabledRef.current,
         },
         prof ? { accountId: prof.accountId, playerLevel: prof.level } : undefined,
       );
@@ -1418,6 +1424,7 @@ export default function App() {
           selectedGameMode={selectedGameMode}
           selectedDifficulty={selectedDifficulty}
           selectedBotDifficulty={selectedBotDifficulty}
+          boatDamageEnabled={boatDamageEnabled}
           accountProfile={profileSnapshot?.profile ?? null}
           claimableRewardsCount={claimableRewardsCount}
           rareEvent={profileSnapshot?.rareEvent ?? null}
@@ -1434,6 +1441,7 @@ export default function App() {
             setSelectedBotDifficulty(botDiff);
             setCreateSettings((prev) => ({ ...prev, botDifficulty: botDiff }));
           }}
+          onToggleBoatDamage={(enabled) => setBoatDamageEnabled(enabled)}
           onStartSolo={handleStartSolo}
           onStartTutorial={handleStartTutorial}
           onStartPractice={handleStartPractice}

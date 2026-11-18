@@ -1832,6 +1832,29 @@ export class ProgressionController {
       const courseId = isValidCourseId(body.courseId) ? body.courseId : 'tropical';
       const gameMode = isValidGameMode(body.gameMode) ? body.gameMode : 'standard';
       const difficulty = isValidDifficulty(body.difficulty) ? body.difficulty : 'normal';
+
+      const SOLO_TOKEN_TTL_MS = 30 * 60 * 1000;
+      // Prune expired unconsumed tokens for this account
+      this.sql.exec(
+        `DELETE FROM solo_run_tokens WHERE account_id = ? AND consumed = 0 AND issued_at < ?`,
+        caller.account_id,
+        nowMs - SOLO_TOKEN_TTL_MS,
+      );
+      // Prevent minting unlimited fake runs: max 8 tokens per account per minute
+      const recentCountRow = this.sql
+        .exec<{ cnt: number }>(
+          `SELECT COUNT(*) AS cnt FROM solo_run_tokens WHERE account_id = ? AND issued_at >= ?`,
+          caller.account_id,
+          nowMs - 60_000,
+        )
+        .toArray()[0];
+      if ((recentCountRow?.cnt ?? 0) >= 8) {
+        return jsonResp(
+          { error: makeErrorPayload('RATE_LIMITED', 'تم تجاوز الحد المسموح لبدء الجولات الفردية، حاول بعد قليل.') },
+          429,
+        );
+      }
+
       const soloRunToken = crypto.randomUUID();
       this.sql.exec(
         `INSERT INTO solo_run_tokens (token, account_id, course_id, game_mode, difficulty, issued_at, consumed)
@@ -1843,7 +1866,7 @@ export class ProgressionController {
         difficulty,
         nowMs,
       );
-      return jsonResp({ soloRunToken, issuedAt: nowMs }, 201);
+      return jsonResp({ soloRunToken, issuedAt: nowMs, expiresAt: nowMs + SOLO_TOKEN_TTL_MS }, 201);
     }
 
     if (path === '/internal/prog/record-match' && request.method === 'POST') {
@@ -1906,19 +1929,37 @@ export class ProgressionController {
         }>(`SELECT * FROM solo_run_tokens WHERE token = ?`, token)
         .toArray()[0];
 
+      const SOLO_TOKEN_TTL_MS = 30 * 60 * 1000;
       if (
         !tokenRow ||
         tokenRow.account_id !== caller.account_id ||
         tokenRow.consumed !== 0 ||
         tokenRow.course_id !== body.courseId ||
         tokenRow.game_mode !== body.gameMode ||
-        tokenRow.difficulty !== body.difficulty
+        tokenRow.difficulty !== body.difficulty ||
+        nowMs - tokenRow.issued_at > SOLO_TOKEN_TTL_MS
       ) {
         return jsonResp(
           {
             error: makeErrorPayload(
               'RESULT_VERIFICATION_FAILED',
-              'رمز إثبات الجولة غير صالح أو تم استخدامه مسبقاً أو لا يطابق إعدادات الجولة.',
+              'رمز إثبات الجولة غير صالح أو منتهي الصلاحية أو تم استخدامه مسبقاً.',
+            ),
+          },
+          422,
+        );
+      }
+
+      const wallClockSec = Math.max(0, (nowMs - tokenRow.issued_at) / 1000);
+      const claimedElapsed = typeof body.elapsedTimeSec === 'number' && Number.isFinite(body.elapsedTimeSec)
+        ? body.elapsedTimeSec
+        : 0;
+      if (body.outcome === 'victory' && wallClockSec < Math.min(claimedElapsed, 180) * 0.8 - 2) {
+        return jsonResp(
+          {
+            error: makeErrorPayload(
+              'RESULT_VERIFICATION_FAILED',
+              'الزمن الفعلي منذ بدء الجولة لا يطابق زمن الإنجاز المُرسل.',
             ),
           },
           422,

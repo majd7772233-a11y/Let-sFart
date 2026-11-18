@@ -195,17 +195,7 @@ export async function saveRoundReplayInD1(
   }
 
   await ensureD1Schema(db);
-  const existing = await db
-    .prepare(`SELECT match_id FROM d1_round_replays WHERE match_id = ?`)
-    .bind(replay.matchId)
-    .first<{ match_id: string }>();
-
-  if (existing) {
-    return { inserted: false };
-  }
-
-  opsMetrics.saveFallbackReplay(replay);
-  await db
+  const res = await db
     .prepare(
       `INSERT OR IGNORE INTO d1_round_replays (
         match_id, room_code, mode, course_id, game_mode, difficulty, outcome,
@@ -232,6 +222,11 @@ export async function saveRoundReplayInD1(
     )
     .run();
 
+  const changes = Number((res as { meta?: { changes?: number } })?.meta?.changes ?? 0);
+  if (changes <= 0) {
+    return { inserted: false };
+  }
+  opsMetrics.saveFallbackReplay(replay);
   return { inserted: true };
 }
 
@@ -421,5 +416,48 @@ export async function recordOpsEventInD1(
       .run();
   } catch {
     // Non-fatal ops telemetry write
+  }
+}
+
+export async function syncAccountMirrorInD1(
+  db: D1DatabaseLike | undefined,
+  account: {
+    accountId: string;
+    username?: string | null;
+    displayName: string;
+    level: number;
+    xp: number;
+    wins: number;
+    updatedAt?: number;
+  },
+): Promise<void> {
+  if (!db || !account.accountId) return;
+  try {
+    await ensureD1Schema(db);
+    await db
+      .prepare(
+        `INSERT INTO d1_accounts_mirror (
+          account_id, username, display_name, level, xp, wins, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(account_id) DO UPDATE SET
+          username = excluded.username,
+          display_name = excluded.display_name,
+          level = excluded.level,
+          xp = excluded.xp,
+          wins = excluded.wins,
+          updated_at = excluded.updated_at`,
+      )
+      .bind(
+        account.accountId,
+        account.username ?? null,
+        account.displayName,
+        account.level,
+        account.xp,
+        account.wins,
+        account.updatedAt ?? Date.now(),
+      )
+      .run();
+  } catch {
+    // Non-fatal mirror sync
   }
 }

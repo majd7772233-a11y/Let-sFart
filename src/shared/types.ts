@@ -282,6 +282,7 @@ export interface WorldSimulationState {
   pickups: PickupSimState[];
   raftHp: number;
   maxHp: number;
+  boatDamageEnabled?: boolean;
   shieldHits: number;
   shieldTimer: number;
   magnetTimer: number;

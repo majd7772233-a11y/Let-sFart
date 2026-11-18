@@ -352,45 +352,79 @@ export function computeSwarmBotDirectives(
     state.chaosModifier === 'reverse_controls' && profile.id !== 'easy';
   const dirSign = controlsReversed ? -1 : 1;
 
+  // Read human player(s) intent so bots actively cooperate with the player!
+  const activeHumans = state.players.filter((p) => !p.isBot && p.connected);
+  const humanMoveDir =
+    activeHumans.length > 0
+      ? activeHumans.reduce((sum, h) => sum + h.moveDir, 0) / activeHumans.length
+      : 0;
+  const humanLocalX =
+    activeHumans.length > 0
+      ? activeHumans.reduce((sum, h) => sum + h.localX, 0) / activeHumans.length
+      : 0;
+
   for (const player of activeBots) {
     const personality = resolvePersonality(player);
-    const isLeftSlot = player.slot === 0 || player.slot === 2;
     const isFrontSlot = player.slot === 2 || player.slot === 3;
-    const slotDefaultX = isLeftSlot ? -1.3 : 1.3;
+    // Slight personal seat anchor around center so bots don't stack on one pixel,
+    // while still able to cross freely to BOTH left (-1.35) and right (+1.35) sides.
+    const seatBias = (player.slot - 1.5) * 0.22;
 
     // 1. Movement / Roll-Balance Steering (`moveDir`)
-    // Combine swarm yaw steering, personality bias, and crew balance
-    let desiredShiftX = slotDefaultX + Math.max(-0.85, Math.min(0.85, yawCommand * 0.9));
+    // Combine swarm corridor yaw steering, human teamwork, and distinct personality goals
+    let desiredShiftX = seatBias + Math.max(-1.15, Math.min(1.15, yawCommand * 1.05));
 
-    if (personality === 'balancer') {
-      // Counter roll, windX, and asymmetric crew weights actively
-      const windCounter = -state.windX * 0.08;
-      const rollCounter = -state.raft.roll * 1.9;
-      const weightCounter = -crewImbalance * 0.35;
-      desiredShiftX += Math.max(-0.9, Math.min(0.9, windCounter + rollCounter + weightCounter));
+    if (personality === 'rusher') {
+      // Rusher teams up with the human's steering direction to carve aggressive turns & hit boost pads
+      desiredShiftX += humanMoveDir * 0.65;
+      let nearestPadDx = 0;
+      let bestPadDist = 16;
+      for (const pad of course.boostPads) {
+        if (pad.z > state.raft.z || pad.z < state.raft.z - 16) continue;
+        const d = state.raft.z - pad.z;
+        if (d < bestPadDist) {
+          bestPadDist = d;
+          nearestPadDx = pad.x - state.raft.x;
+        }
+      }
+      if (bestPadDist < 16) {
+        desiredShiftX += Math.max(-0.8, Math.min(0.8, nearestPadDx * 0.2));
+      }
+    } else if (personality === 'balancer') {
+      // Balancer actively counter-balances the human's weight, raft roll, and side winds
+      const windCounter = -state.windX * 0.09;
+      const rollCounter = -state.raft.roll * 2.1;
+      const humanCounter = -humanLocalX * 0.55;
+      const weightCounter = -crewImbalance * 0.25;
+      desiredShiftX =
+        Math.max(-1.3, Math.min(1.3, windCounter + rollCounter + humanCounter + weightCounter + yawCommand * 0.45));
     } else if (personality === 'cautious') {
-      // Lean gently toward channel center away from wall edges
-      const edgePush = (swarmPlan.channelCenterX - state.raft.x) * 0.14;
-      desiredShiftX += Math.max(-0.6, Math.min(0.6, edgePush));
+      // Cautious leans strongly toward the safest channel center away from walls & hazards
+      const edgePush = (swarmPlan.channelCenterX - state.raft.x) * 0.22;
+      desiredShiftX += Math.max(-0.95, Math.min(0.95, edgePush));
     } else if (personality === 'treasure_hunter') {
-      // Look for closest uncollected coin/chest within short lateral range
+      // Treasure hunter actively shifts left OR right to steer toward the nearest coin/chest
       let nearestCoinDx = 0;
-      let bestDist = 14;
+      let bestDist = 18;
       for (const tr of state.treasures) {
-        if (tr.collected || tr.z > state.raft.z || tr.z < state.raft.z - 14) continue;
+        if (tr.collected || tr.z > state.raft.z || tr.z < state.raft.z - 18) continue;
         const d = state.raft.z - tr.z;
         if (d < bestDist) {
           bestDist = d;
           nearestCoinDx = tr.x - state.raft.x;
         }
       }
-      if (bestDist < 14) {
-        desiredShiftX += Math.max(-0.7, Math.min(0.7, nearestCoinDx * 0.15));
+      if (bestDist < 18) {
+        desiredShiftX = Math.max(-1.35, Math.min(1.35, nearestCoinDx * 0.28 + yawCommand * 0.45));
+      } else {
+        // When no treasure is nearby, cooperate gently with human steering
+        desiredShiftX += humanMoveDir * 0.35;
       }
     }
 
+    desiredShiftX = Math.max(-1.35, Math.min(1.35, desiredShiftX));
     const dx = desiredShiftX - player.localX;
-    let rawMoveDir: -1 | 0 | 1 = dx > 0.16 ? 1 : dx < -0.16 ? -1 : 0;
+    let rawMoveDir: -1 | 0 | 1 = dx > 0.14 ? 1 : dx < -0.14 ? -1 : 0;
     if (dirSign === -1 && rawMoveDir !== 0) {
       rawMoveDir = (rawMoveDir === 1 ? -1 : 1) as -1 | 1;
     }

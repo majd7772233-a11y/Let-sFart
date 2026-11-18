@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   GAME_VERSION,
   PROTOCOL_VERSION,
@@ -13,7 +13,7 @@ import {
 } from '../../src/shared/protocol.ts';
 import { createInitialSimState, DEFAULT_ROOM_SETTINGS } from '../../src/shared/physics.ts';
 import type { MatchSummaryInput, RoundReplayRecord, VerifiedMatchRecord } from '../../src/shared/types.ts';
-import { getBalanceAnalyticsFromD1, recordVerifiedMatchInD1 } from '../src/db/d1Store.ts';
+import { getBalanceAnalyticsFromD1, recordVerifiedMatchInD1, saveRoundReplayInD1 } from '../src/db/d1Store.ts';
 import { activateTempBotSubstitutesIfNeeded, syncBotsInRoom } from '../src/rooms/lifecycle.ts';
 import { BOT_SUBSTITUTE_DELAY_MS, type RoomRecord } from '../src/rooms/types.ts';
 import { routeWorkerRequest } from '../src/router.ts';
@@ -320,6 +320,7 @@ describe('BOT-04 & TECH-01..07: Temp Bot Takeover, D1 Idempotency, Result Verifi
       isOnline: false,
       soloRunToken,
     };
+    const nowSpyLegit = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 45_000);
     const legitRes = await routeWorkerRequest(
       new Request('http://localhost/api/v1/progression/record-match', {
         method: 'POST',
@@ -328,6 +329,7 @@ describe('BOT-04 & TECH-01..07: Temp Bot Takeover, D1 Idempotency, Result Verifi
       }),
       env,
     );
+    nowSpyLegit.mockRestore();
     expect(legitRes.status).toBe(200);
     const reward = (await legitRes.json()) as RecordMatchHttpResponse;
     expect(reward.xpEarned).toBeGreaterThan(0);
@@ -570,7 +572,8 @@ describe('BOT-04 & TECH-01..07: Temp Bot Takeover, D1 Idempotency, Result Verifi
     );
     expect(inflatedRes.status).toBe(422);
 
-    // 4. Valid token works once, then reusing it on a different submissionKey is rejected -> 422
+    // 4. Valid token works once after real elapsed time, then reusing it on a different submissionKey is rejected -> 422
+    const nowSpyValid = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 45_000);
     const validRes = await routeWorkerRequest(
       new Request('http://localhost/api/v1/progression/record-match', {
         method: 'POST',
@@ -579,6 +582,7 @@ describe('BOT-04 & TECH-01..07: Temp Bot Takeover, D1 Idempotency, Result Verifi
       }),
       env,
     );
+    nowSpyValid.mockRestore();
     expect(validRes.status).toBe(200);
 
     const reuseRes = await routeWorkerRequest(
@@ -836,5 +840,148 @@ describe('BOT-04 & TECH-01..07: Temp Bot Takeover, D1 Idempotency, Result Verifi
     expect(survAnalytics.courses).toHaveLength(1);
     expect(survAnalytics.courses[0].gameMode).toBe('survival');
     expect(survAnalytics.courses[0].courseId).toBe('storm');
+  });
+
+  it('AUDIT #10: soloRunToken enforces real wall-clock elapsed time, 30-min TTL, and per-account minting cap', async () => {
+    const { env, namespace } = setupTestEnv();
+    disposeEnv = () => namespace.disposeAll();
+
+    const guestRes = await routeWorkerRequest(
+      new Request('http://localhost/api/v1/auth/guest', {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify({ displayName: 'مختبر الزمن الفعلي' }),
+      }),
+      env,
+    );
+    const guest = (await guestRes.json()) as AuthHttpResponse;
+
+    const tokRes = await routeWorkerRequest(
+      new Request('http://localhost/api/v1/progression/start-solo-run', {
+        method: 'POST',
+        headers: headers(guest.token),
+        body: JSON.stringify({ courseId: 'tropical', gameMode: 'standard', difficulty: 'normal' }),
+      }),
+      env,
+    );
+    expect(tokRes.status).toBe(201);
+    const { soloRunToken } = (await tokRes.json()) as { soloRunToken: string };
+
+    const matchPayload: MatchSummaryInput = {
+      submissionKey: 'instant-forge-1',
+      courseId: 'tropical',
+      gameMode: 'standard',
+      difficulty: 'normal',
+      outcome: 'victory',
+      elapsedTimeSec: 40,
+      falls: 0,
+      itemsUsed: 2,
+      pushContribution: 200,
+      fartTimeSec: 12,
+      survivalDistance: 0,
+      treasureScore: 0,
+      harmonyCombos: 1,
+      hardGatesPassed: 2,
+      cleanCheckpoints: 2,
+      minRaftHp: 90,
+      isOnline: false,
+      soloRunToken,
+    };
+
+    // 1. Immediate submission right after minting -> rejected (422) because wall-clock < 40s*0.8-2
+    const instantRes = await routeWorkerRequest(
+      new Request('http://localhost/api/v1/progression/record-match', {
+        method: 'POST',
+        headers: headers(guest.token),
+        body: JSON.stringify(matchPayload),
+      }),
+      env,
+    );
+    expect(instantRes.status).toBe(422);
+
+    // 2. Expired token (>30 min later) -> rejected (422)
+    const expiredSpy = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 31 * 60 * 1000);
+    const expiredRes = await routeWorkerRequest(
+      new Request('http://localhost/api/v1/progression/record-match', {
+        method: 'POST',
+        headers: headers(guest.token),
+        body: JSON.stringify(matchPayload),
+      }),
+      env,
+    );
+    expiredSpy.mockRestore();
+    expect(expiredRes.status).toBe(422);
+
+    // 3. Minting >8 tokens within 60s -> 429 RATE_LIMITED
+    let hitRateLimit = false;
+    for (let i = 0; i < 9; i += 1) {
+      const r = await routeWorkerRequest(
+        new Request('http://localhost/api/v1/progression/start-solo-run', {
+          method: 'POST',
+          headers: headers(guest.token),
+          body: JSON.stringify({ courseId: 'tropical', gameMode: 'standard', difficulty: 'normal' }),
+        }),
+        env,
+      );
+      if (r.status === 429) {
+        hitRateLimit = true;
+        break;
+      }
+    }
+    expect(hitRateLimit).toBe(true);
+  });
+
+  it('AUDIT #11 & #12: concurrent saveRoundReplayInD1 returns inserted:true only once and d1_accounts_mirror syncs on auth', async () => {
+    const { env, namespace } = setupTestEnv();
+    disposeEnv = () => namespace.disposeAll();
+
+    const replay: RoundReplayRecord = {
+      matchId: 'solo:concurrent-replay-1',
+      roomCode: null,
+      mode: 'solo',
+      courseId: 'tropical',
+      gameMode: 'standard',
+      difficulty: 'normal',
+      botDifficulty: 'normal',
+      outcome: 'victory',
+      durationSec: 40,
+      falls: 0,
+      treasureScore: 0,
+      survivalDistance: 0,
+      minRaftHp: 90,
+      createdAt: Date.now(),
+      players: [{ slot: 0, name: 'قبطان', isBot: false, colorIndex: 0, pushContribution: 120 }],
+      frames: [
+        { t: 0, x: 0, z: 0, yaw: 0, progress: 0, raftHp: 100, harmony: 0.1, windX: 0 },
+        { t: 40, x: 0, z: -300, yaw: 0, progress: 1, raftHp: 90, harmony: 0.8, windX: 0 },
+      ],
+      events: [],
+    };
+
+    const [s1, s2] = await Promise.all([
+      saveRoundReplayInD1(env.DB, replay),
+      saveRoundReplayInD1(env.DB, replay),
+    ]);
+    expect([s1.inserted, s2.inserted].filter(Boolean)).toHaveLength(1);
+
+    // AUDIT #12: Guest creation syncs d1_accounts_mirror
+    const guestRes = await routeWorkerRequest(
+      new Request('http://localhost/api/v1/auth/guest', {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify({ displayName: 'مرآة الحساب' }),
+      }),
+      env,
+    );
+    expect(guestRes.status).toBe(201);
+    const guest = (await guestRes.json()) as AuthHttpResponse;
+
+    const mirrorRow = await env.DB!
+      .prepare(`SELECT account_id, display_name, level FROM d1_accounts_mirror WHERE account_id = ?`)
+      .bind(guest.profile.accountId)
+      .first<{ account_id: string; display_name: string; level: number }>();
+    expect(mirrorRow).toBeTruthy();
+    expect(mirrorRow?.display_name).toBe('مرآة الحساب');
+    expect(mirrorRow?.level).toBe(1);
   });
 });

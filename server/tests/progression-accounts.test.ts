@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type {
   AuthHttpResponse,
   FriendsHttpResponse,
@@ -82,6 +82,7 @@ describe('PROG-01..05 Permanent Accounts, Profiles, Detailed Stats, Leaderboards
       isOnline: false,
       soloRunToken: tok1,
     };
+    const nowSpy1 = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 50_000);
     const recRes = await routeWorkerRequest(
       new Request('http://localhost/api/v1/progression/record-match', {
         method: 'POST',
@@ -90,6 +91,7 @@ describe('PROG-01..05 Permanent Accounts, Profiles, Detailed Stats, Leaderboards
       }),
       env,
     );
+    nowSpy1.mockRestore();
     expect(recRes.status).toBe(200);
     const recData = (await recRes.json()) as RecordMatchHttpResponse;
     expect(recData.alreadyRecorded).toBe(false);
@@ -292,6 +294,7 @@ describe('PROG-01..05 Permanent Accounts, Profiles, Detailed Stats, Leaderboards
       soloRunToken: p1SoloTok,
     };
 
+    const nowSpyP1 = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 50_000);
     const r1 = await routeWorkerRequest(
       new Request('http://localhost/api/v1/progression/record-match', {
         method: 'POST',
@@ -300,6 +303,7 @@ describe('PROG-01..05 Permanent Accounts, Profiles, Detailed Stats, Leaderboards
       }),
       env,
     );
+    nowSpyP1.mockRestore();
     expect(r1.status).toBe(200);
     const rec1 = (await r1.json()) as RecordMatchHttpResponse;
     expect(rec1.alreadyRecorded).toBe(false);
@@ -333,6 +337,7 @@ describe('PROG-01..05 Permanent Accounts, Profiles, Detailed Stats, Leaderboards
       env,
     );
     const { soloRunToken: p2SoloTok } = (await p2TokRes.json()) as { soloRunToken: string };
+    const nowSpyP2 = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 65_000);
     await routeWorkerRequest(
       new Request('http://localhost/api/v1/progression/record-match', {
         method: 'POST',
@@ -348,6 +353,7 @@ describe('PROG-01..05 Permanent Accounts, Profiles, Detailed Stats, Leaderboards
       }),
       env,
     );
+    nowSpyP2.mockRestore();
 
     // Global volcanic best_time leaderboard ranks P1 #1 ahead of P2 & pioneers
     const lbVolcanicRes = await routeWorkerRequest(
@@ -513,6 +519,7 @@ describe('PROG-01..05 Permanent Accounts, Profiles, Detailed Stats, Leaderboards
         env,
       );
       const { soloRunToken: loopTok } = (await loopTokRes.json()) as { soloRunToken: string };
+      const nowSpyLoop = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 65_000);
       const recRes = await routeWorkerRequest(
         new Request('http://localhost/api/v1/progression/record-match', {
           method: 'POST',
@@ -541,6 +548,7 @@ describe('PROG-01..05 Permanent Accounts, Profiles, Detailed Stats, Leaderboards
         }),
         env,
       );
+      nowSpyLoop.mockRestore();
       expect(recRes.status).toBe(200);
       lastRec = (await recRes.json()) as RecordMatchHttpResponse;
       expect(lastRec.coinsEarned).toBeGreaterThan(0);
