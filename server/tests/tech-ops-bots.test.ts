@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   GAME_VERSION,
   PROTOCOL_VERSION,
+  type AuthHttpResponse,
   type HttpErrorResponse,
   type OpsAnalyticsHttpResponse,
   type OpsStatusHttpResponse,
@@ -11,11 +12,12 @@ import {
   type SaveReplayHttpResponse,
 } from '../../src/shared/protocol.ts';
 import { createInitialSimState, DEFAULT_ROOM_SETTINGS } from '../../src/shared/physics.ts';
-import type { MatchSummaryInput, RoundReplayRecord } from '../../src/shared/types.ts';
-import { recordVerifiedMatchInD1 } from '../src/db/d1Store.ts';
+import type { MatchSummaryInput, RoundReplayRecord, VerifiedMatchRecord } from '../../src/shared/types.ts';
+import { getBalanceAnalyticsFromD1, recordVerifiedMatchInD1 } from '../src/db/d1Store.ts';
 import { activateTempBotSubstitutesIfNeeded, syncBotsInRoom } from '../src/rooms/lifecycle.ts';
 import { BOT_SUBSTITUTE_DELAY_MS, type RoomRecord } from '../src/rooms/types.ts';
 import { routeWorkerRequest } from '../src/router.ts';
+import { recordOnlineBatchViaService } from '../src/services/progressionService.ts';
 import { connectAndAuthWs, createRoomHttp, flush, joinRoomHttp, setupTestEnv } from './helpers.ts';
 
 function headers(token?: string, extra?: Record<string, string>): Record<string, string> {
@@ -286,7 +288,18 @@ describe('BOT-04 & TECH-01..07: Temp Bot Takeover, D1 Idempotency, Result Verifi
     const cheatErr = (await cheatRes.json()) as HttpErrorResponse;
     expect(cheatErr.error.code).toBe('RESULT_VERIFICATION_FAILED');
 
-    // 2. Plausible victory -> 200
+    // 2. Plausible victory with server-issued soloRunToken -> 200
+    const tokRes = await routeWorkerRequest(
+      new Request('http://localhost/api/v1/progression/start-solo-run', {
+        method: 'POST',
+        headers: headers(guest.token),
+        body: JSON.stringify({ courseId: 'tropical', gameMode: 'standard', difficulty: 'normal' }),
+      }),
+      env,
+    );
+    expect(tokRes.status).toBe(201);
+    const { soloRunToken } = (await tokRes.json()) as { soloRunToken: string };
+
     const legitMatch: MatchSummaryInput = {
       submissionKey: 'legit-1',
       courseId: 'tropical',
@@ -305,6 +318,7 @@ describe('BOT-04 & TECH-01..07: Temp Bot Takeover, D1 Idempotency, Result Verifi
       cleanCheckpoints: 2,
       minRaftHp: 74,
       isOnline: false,
+      soloRunToken,
     };
     const legitRes = await routeWorkerRequest(
       new Request('http://localhost/api/v1/progression/record-match', {
@@ -328,6 +342,16 @@ describe('BOT-04 & TECH-01..07: Temp Bot Takeover, D1 Idempotency, Result Verifi
   it('TECH-04: round replay save, list, and detail retrieval roundtrip', async () => {
     const { env, namespace } = setupTestEnv();
     disposeEnv = () => namespace.disposeAll();
+
+    const guestRes = await routeWorkerRequest(
+      new Request('http://localhost/api/v1/auth/guest', {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify({ displayName: 'قبطان الإعادة' }),
+      }),
+      env,
+    );
+    const guest = (await guestRes.json()) as AuthHttpResponse;
 
     const replay: RoundReplayRecord = {
       matchId: 'solo:replay-test-1',
@@ -362,7 +386,7 @@ describe('BOT-04 & TECH-01..07: Temp Bot Takeover, D1 Idempotency, Result Verifi
     const saveRes = await routeWorkerRequest(
       new Request('http://localhost/api/v1/replays', {
         method: 'POST',
-        headers: headers(),
+        headers: headers(guest.token),
         body: JSON.stringify({ replay }),
       }),
       env,
@@ -378,10 +402,10 @@ describe('BOT-04 & TECH-01..07: Temp Bot Takeover, D1 Idempotency, Result Verifi
     );
     expect(listRes.status).toBe(200);
     const list = (await listRes.json()) as ReplayListHttpResponse;
-    expect(list.replays.some((r) => r.matchId === replay.matchId)).toBe(true);
+    expect(list.replays.some((r) => r.matchId === saved.matchId)).toBe(true);
 
     const detailRes = await routeWorkerRequest(
-      new Request(`http://localhost/api/v1/replays/${encodeURIComponent(replay.matchId)}`, {
+      new Request(`http://localhost/api/v1/replays/${encodeURIComponent(saved.matchId)}`, {
         headers: headers(),
       }),
       env,
@@ -430,5 +454,387 @@ describe('BOT-04 & TECH-01..07: Temp Bot Takeover, D1 Idempotency, Result Verifi
       env,
     );
     expect(authOps.status).toBe(200);
+  });
+
+  it('AUDIT P1-1: ops endpoints fail closed in production without OPS_ADMIN_KEY and reject query-string keys', async () => {
+    const { env, namespace } = setupTestEnv();
+    disposeEnv = () => namespace.disposeAll();
+
+    // Production with missing OPS_ADMIN_KEY -> fail closed (401)
+    env.ENVIRONMENT = 'production';
+    env.ALLOWED_ORIGINS = 'http://localhost:3000';
+    delete env.OPS_ADMIN_KEY;
+    const statusNoKey = await routeWorkerRequest(
+      new Request('http://localhost/api/v1/ops/status', { headers: headers() }),
+      env,
+    );
+    expect(statusNoKey.status).toBe(401);
+    const analyticsNoKey = await routeWorkerRequest(
+      new Request('http://localhost/api/v1/ops/analytics', { headers: headers() }),
+      env,
+    );
+    expect(analyticsNoKey.status).toBe(401);
+
+    // Query string key must be rejected even when OPS_ADMIN_KEY is configured
+    env.OPS_ADMIN_KEY = 'prod-ops-secret-123';
+    const qsAttempt = await routeWorkerRequest(
+      new Request('http://localhost/api/v1/ops/status?adminKey=prod-ops-secret-123', { headers: headers() }),
+      env,
+    );
+    expect(qsAttempt.status).toBe(401);
+
+    // Header key succeeds
+    const headerAttempt = await routeWorkerRequest(
+      new Request('http://localhost/api/v1/ops/status', {
+        headers: headers(undefined, { 'x-ops-key': 'prod-ops-secret-123' }),
+      }),
+      env,
+    );
+    expect(headerAttempt.status).toBe(200);
+  });
+
+  it('AUDIT P1-2: blocks forged client online matches, missing/reused soloRunToken, and inflated achievement counters', async () => {
+    const { env, namespace } = setupTestEnv();
+    disposeEnv = () => namespace.disposeAll();
+
+    const guestRes = await routeWorkerRequest(
+      new Request('http://localhost/api/v1/auth/guest', {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify({ displayName: 'مختبر الحماية' }),
+      }),
+      env,
+    );
+    const guest = (await guestRes.json()) as AuthHttpResponse;
+
+    const baseMatch: MatchSummaryInput = {
+      submissionKey: 'forge-1',
+      courseId: 'tropical',
+      gameMode: 'standard',
+      difficulty: 'normal',
+      outcome: 'victory',
+      elapsedTimeSec: 40,
+      falls: 0,
+      itemsUsed: 2,
+      pushContribution: 200,
+      fartTimeSec: 12,
+      survivalDistance: 0,
+      treasureScore: 0,
+      harmonyCombos: 1,
+      hardGatesPassed: 2,
+      cleanCheckpoints: 2,
+      minRaftHp: 90,
+      isOnline: false,
+    };
+
+    // 1. Client claiming isOnline: true -> 403
+    const onlineForgeRes = await routeWorkerRequest(
+      new Request('http://localhost/api/v1/progression/record-match', {
+        method: 'POST',
+        headers: headers(guest.token),
+        body: JSON.stringify({ ...baseMatch, isOnline: true }),
+      }),
+      env,
+    );
+    expect(onlineForgeRes.status).toBe(403);
+
+    // 2. Solo match without soloRunToken -> 422
+    const noTokRes = await routeWorkerRequest(
+      new Request('http://localhost/api/v1/progression/record-match', {
+        method: 'POST',
+        headers: headers(guest.token),
+        body: JSON.stringify(baseMatch),
+      }),
+      env,
+    );
+    expect(noTokRes.status).toBe(422);
+
+    // 3. Inflated hardGatesPassed / cleanCheckpoints even with valid token -> 422
+    const tok1Res = await routeWorkerRequest(
+      new Request('http://localhost/api/v1/progression/start-solo-run', {
+        method: 'POST',
+        headers: headers(guest.token),
+        body: JSON.stringify({ courseId: 'tropical', gameMode: 'standard', difficulty: 'normal' }),
+      }),
+      env,
+    );
+    const { soloRunToken: tok1 } = (await tok1Res.json()) as { soloRunToken: string };
+
+    const inflatedRes = await routeWorkerRequest(
+      new Request('http://localhost/api/v1/progression/record-match', {
+        method: 'POST',
+        headers: headers(guest.token),
+        body: JSON.stringify({ ...baseMatch, hardGatesPassed: 999, soloRunToken: tok1 }),
+      }),
+      env,
+    );
+    expect(inflatedRes.status).toBe(422);
+
+    // 4. Valid token works once, then reusing it on a different submissionKey is rejected -> 422
+    const validRes = await routeWorkerRequest(
+      new Request('http://localhost/api/v1/progression/record-match', {
+        method: 'POST',
+        headers: headers(guest.token),
+        body: JSON.stringify({ ...baseMatch, submissionKey: 'valid-once', soloRunToken: tok1 }),
+      }),
+      env,
+    );
+    expect(validRes.status).toBe(200);
+
+    const reuseRes = await routeWorkerRequest(
+      new Request('http://localhost/api/v1/progression/record-match', {
+        method: 'POST',
+        headers: headers(guest.token),
+        body: JSON.stringify({ ...baseMatch, submissionKey: 'reuse-attempt', soloRunToken: tok1 }),
+      }),
+      env,
+    );
+    expect(reuseRes.status).toBe(422);
+  });
+
+  it('AUDIT P2-3: rejected online round batch awards zero XP/coins/stats', async () => {
+    const { env, namespace } = setupTestEnv();
+    disposeEnv = () => namespace.disposeAll();
+
+    const guestRes = await routeWorkerRequest(
+      new Request('http://localhost/api/v1/auth/guest', {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify({ displayName: 'لاعب أونلاين' }),
+      }),
+      env,
+    );
+    const guest = (await guestRes.json()) as AuthHttpResponse;
+
+    await recordOnlineBatchViaService(env, [
+      {
+        accountId: guest.profile.accountId,
+        match: {
+          submissionKey: 'online:BADROOM:r1',
+          courseId: 'tropical',
+          gameMode: 'standard',
+          difficulty: 'normal',
+          outcome: 'victory',
+          elapsedTimeSec: 1.0, // impossible speed -> rejected
+          falls: 0,
+          itemsUsed: 0,
+          pushContribution: 100,
+          fartTimeSec: 1,
+          survivalDistance: 0,
+          treasureScore: 0,
+          harmonyCombos: 0,
+          hardGatesPassed: 0,
+          minRaftHp: 100,
+          isOnline: true,
+        },
+      },
+    ]);
+
+    const profRes = await routeWorkerRequest(
+      new Request('http://localhost/api/v1/profile', {
+        method: 'GET',
+        headers: headers(guest.token),
+      }),
+      env,
+    );
+    const profData = (await profRes.json()) as { stats: { roundsPlayed: number }; profile: { xp: number } };
+    expect(profData.stats.roundsPlayed).toBe(0);
+    expect(profData.profile.xp).toBe(0);
+  });
+
+  it('AUDIT P2-4: replays require auth, block client online uploads, validate frames, and reject overwrites with 409', async () => {
+    const { env, namespace } = setupTestEnv();
+    disposeEnv = () => namespace.disposeAll();
+
+    const guestRes = await routeWorkerRequest(
+      new Request('http://localhost/api/v1/auth/guest', {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify({ displayName: 'حارس الإعادات' }),
+      }),
+      env,
+    );
+    const guest = (await guestRes.json()) as AuthHttpResponse;
+
+    const validReplay: RoundReplayRecord = {
+      matchId: 'solo:immutable-check',
+      roomCode: null,
+      mode: 'solo',
+      courseId: 'tropical',
+      gameMode: 'standard',
+      difficulty: 'normal',
+      botDifficulty: 'normal',
+      outcome: 'victory',
+      durationSec: 42,
+      falls: 0,
+      treasureScore: 0,
+      survivalDistance: 0,
+      minRaftHp: 90,
+      createdAt: Date.now(),
+      players: [{ slot: 0, name: 'قبطان', isBot: false, colorIndex: 0, pushContribution: 150 }],
+      frames: [
+        { t: 0, x: 0, z: 0, yaw: 0, progress: 0, raftHp: 100, harmony: 0.1, windX: 0 },
+        { t: 42, x: 0, z: -300, yaw: 0, progress: 1, raftHp: 90, harmony: 0.8, windX: 0 },
+      ],
+      events: [],
+    };
+
+    // 1. Anonymous upload -> 401
+    const anonRes = await routeWorkerRequest(
+      new Request('http://localhost/api/v1/replays', {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify({ replay: validReplay }),
+      }),
+      env,
+    );
+    expect(anonRes.status).toBe(401);
+
+    // 2. Client uploading online replay -> 403
+    const onlineRes = await routeWorkerRequest(
+      new Request('http://localhost/api/v1/replays', {
+        method: 'POST',
+        headers: headers(guest.token),
+        body: JSON.stringify({ replay: { ...validReplay, mode: 'online', matchId: 'online:FAKE:r1' } }),
+      }),
+      env,
+    );
+    expect(onlineRes.status).toBe(403);
+
+    // 3. Malformed frame -> 400
+    const badFrameRes = await routeWorkerRequest(
+      new Request('http://localhost/api/v1/replays', {
+        method: 'POST',
+        headers: headers(guest.token),
+        body: JSON.stringify({
+          replay: {
+            ...validReplay,
+            frames: [{ t: -5, x: 'bad', z: 0, yaw: 0, progress: 99, raftHp: 999, harmony: 0, windX: 0 }],
+          },
+        }),
+      }),
+      env,
+    );
+    expect(badFrameRes.status).toBe(400);
+
+    // 4. First valid save -> 201; duplicate save -> 409 (immutable)
+    const firstSave = await routeWorkerRequest(
+      new Request('http://localhost/api/v1/replays', {
+        method: 'POST',
+        headers: headers(guest.token),
+        body: JSON.stringify({ replay: validReplay }),
+      }),
+      env,
+    );
+    expect(firstSave.status).toBe(201);
+
+    const dupSave = await routeWorkerRequest(
+      new Request('http://localhost/api/v1/replays', {
+        method: 'POST',
+        headers: headers(guest.token),
+        body: JSON.stringify({ replay: validReplay }),
+      }),
+      env,
+    );
+    expect(dupSave.status).toBe(409);
+  });
+
+  it('AUDIT #7: concurrent duplicate recordVerifiedMatchInD1 increments totalRuns only once', async () => {
+    const { env, namespace } = setupTestEnv();
+    disposeEnv = () => namespace.disposeAll();
+
+    const db = env.DB;
+    const record: VerifiedMatchRecord = {
+      submissionKey: 'concurrent:match:dup-1',
+      matchId: 'concurrent-dup-1',
+      roomCode: 'CONC01',
+      accountId: 'acc-concurrent',
+      mode: 'online',
+      courseId: 'volcanic',
+      gameMode: 'survival',
+      difficulty: 'hard',
+      outcome: 'victory',
+      elapsedTimeSec: 52.5,
+      falls: 1,
+      itemsUsed: 3,
+      collisionCount: 2,
+      treasureScore: 0,
+      survivalDistance: 420,
+      minRaftHp: 75,
+      verifiedAt: Date.now(),
+    };
+
+    const [r1, r2] = await Promise.all([
+      recordVerifiedMatchInD1(db, record),
+      recordVerifiedMatchInD1(db, record),
+    ]);
+
+    expect([r1.inserted, r2.inserted].filter(Boolean)).toHaveLength(1);
+    const analytics = await getBalanceAnalyticsFromD1(db, { courseId: 'volcanic', gameMode: 'survival' });
+    expect(analytics.courses).toHaveLength(1);
+    expect(analytics.courses[0].totalRuns).toBe(1);
+    expect(analytics.totalVerifiedMatches).toBe(1);
+  });
+
+  it('AUDIT #8 & #9: ops/status marks isolate_local scope and ops/analytics filters by gameMode and courseId', async () => {
+    const { env, namespace } = setupTestEnv();
+    disposeEnv = () => namespace.disposeAll();
+
+    const db = env.DB;
+
+    await recordVerifiedMatchInD1(db, {
+      submissionKey: 'filter:std-1',
+      matchId: 'filter-std-1',
+      roomCode: null,
+      accountId: 'acc-1',
+      mode: 'solo',
+      courseId: 'tropical',
+      gameMode: 'standard',
+      difficulty: 'normal',
+      outcome: 'victory',
+      elapsedTimeSec: 44,
+      falls: 0,
+      itemsUsed: 2,
+      collisionCount: 1,
+      treasureScore: 0,
+      survivalDistance: 0,
+      minRaftHp: 90,
+      verifiedAt: Date.now(),
+    });
+    await recordVerifiedMatchInD1(db, {
+      submissionKey: 'filter:surv-1',
+      matchId: 'filter-surv-1',
+      roomCode: null,
+      accountId: 'acc-1',
+      mode: 'solo',
+      courseId: 'storm',
+      gameMode: 'survival',
+      difficulty: 'hard',
+      outcome: 'victory',
+      elapsedTimeSec: 65,
+      falls: 1,
+      itemsUsed: 4,
+      collisionCount: 2,
+      treasureScore: 0,
+      survivalDistance: 500,
+      minRaftHp: 70,
+      verifiedAt: Date.now(),
+    });
+
+    const statusRes = await routeWorkerRequest(new Request('http://localhost/api/v1/ops/status'), env);
+    expect(statusRes.status).toBe(200);
+    const statusBody = (await statusRes.json()) as OpsStatusHttpResponse;
+    expect(statusBody.metricsScope).toBe('isolate_local');
+    expect(typeof statusBody.metricsNoteAr).toBe('string');
+
+    const survRes = await routeWorkerRequest(
+      new Request('http://localhost/api/v1/ops/analytics?gameMode=survival'),
+      env,
+    );
+    expect(survRes.status).toBe(200);
+    const survAnalytics = (await survRes.json()) as OpsAnalyticsHttpResponse;
+    expect(survAnalytics.courses).toHaveLength(1);
+    expect(survAnalytics.courses[0].gameMode).toBe('survival');
+    expect(survAnalytics.courses[0].courseId).toBe('storm');
   });
 });

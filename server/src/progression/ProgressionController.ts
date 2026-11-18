@@ -8,6 +8,7 @@ import {
   normalizePlayerCosmetic,
 } from '../../../src/shared/cosmetics.ts';
 import { isValidDifficulty, isValidGameMode } from '../../../src/shared/physics.ts';
+import { verifyMatchResult } from '../services/resultVerifier.ts';
 import {
   ACHIEVEMENT_MAP,
   ACTIVE_SEASON_DEF,
@@ -202,6 +203,17 @@ export class ProgressionController {
   public initIfNeeded(nowMs = Date.now()): void {
     if (this.initialized) return;
     initProgressionSchema(this.sql, nowMs);
+    this.sql.exec(
+      `CREATE TABLE IF NOT EXISTS solo_run_tokens (
+        token TEXT PRIMARY KEY,
+        account_id TEXT NOT NULL,
+        course_id TEXT NOT NULL,
+        game_mode TEXT NOT NULL,
+        difficulty TEXT NOT NULL,
+        issued_at INTEGER NOT NULL,
+        consumed INTEGER NOT NULL DEFAULT 0
+      )`,
+    );
     this.initialized = true;
   }
 
@@ -1807,12 +1819,113 @@ export class ProgressionController {
       return jsonResp({ profile: snap.profile, stats: snap.stats, achievements: snap.achievements }, 200);
     }
 
+    if (path === '/internal/prog/start-solo-run' && request.method === 'POST') {
+      const caller = await this.resolveAccountFromBearer(authHeader, nowMs);
+      if (!caller) {
+        return jsonResp({ error: makeErrorPayload('UNAUTHORIZED') }, 401);
+      }
+      const body = (await request.json().catch(() => ({}))) as {
+        courseId?: string;
+        gameMode?: string;
+        difficulty?: string;
+      };
+      const courseId = isValidCourseId(body.courseId) ? body.courseId : 'tropical';
+      const gameMode = isValidGameMode(body.gameMode) ? body.gameMode : 'standard';
+      const difficulty = isValidDifficulty(body.difficulty) ? body.difficulty : 'normal';
+      const soloRunToken = crypto.randomUUID();
+      this.sql.exec(
+        `INSERT INTO solo_run_tokens (token, account_id, course_id, game_mode, difficulty, issued_at, consumed)
+         VALUES (?, ?, ?, ?, ?, ?, 0)`,
+        soloRunToken,
+        caller.account_id,
+        courseId,
+        gameMode,
+        difficulty,
+        nowMs,
+      );
+      return jsonResp({ soloRunToken, issuedAt: nowMs }, 201);
+    }
+
     if (path === '/internal/prog/record-match' && request.method === 'POST') {
       const caller = await this.resolveAccountFromBearer(authHeader, nowMs);
       if (!caller) {
         return jsonResp({ error: makeErrorPayload('UNAUTHORIZED') }, 401);
       }
       const body = (await request.json().catch(() => ({}))) as Partial<MatchSummaryInput>;
+      if (body.isOnline === true) {
+        return jsonResp(
+          {
+            error: makeErrorPayload(
+              'RESULT_VERIFICATION_FAILED',
+              'نتائج الجولات الجماعية تُوثّق من الخادم فقط.',
+            ),
+          },
+          403,
+        );
+      }
+
+      const token = typeof body.soloRunToken === 'string' ? body.soloRunToken.trim() : '';
+      if (!token) {
+        return jsonResp(
+          {
+            error: makeErrorPayload(
+              'RESULT_VERIFICATION_FAILED',
+              'رمز إثبات الجولة الفردية مفقود أو غير صالح.',
+            ),
+          },
+          422,
+        );
+      }
+
+      const submissionKey = typeof body.submissionKey === 'string' ? body.submissionKey.trim() : '';
+      if (submissionKey) {
+        const compositeKey = `${caller.account_id}:${submissionKey}`;
+        const already = this.sql
+          .exec<{ submission_key: string }>(
+            `SELECT submission_key FROM match_submissions WHERE account_id = ? AND (submission_key = ? OR submission_key = ?)`,
+            caller.account_id,
+            compositeKey,
+            submissionKey,
+          )
+          .toArray()[0];
+        if (already) {
+          const result = this.applyMatchForAccount(caller.account_id, body, nowMs);
+          return jsonResp(result, 200);
+        }
+      }
+
+      const tokenRow = this.sql
+        .exec<{
+          token: string;
+          account_id: string;
+          course_id: string;
+          game_mode: string;
+          difficulty: string;
+          issued_at: number;
+          consumed: number;
+        }>(`SELECT * FROM solo_run_tokens WHERE token = ?`, token)
+        .toArray()[0];
+
+      if (
+        !tokenRow ||
+        tokenRow.account_id !== caller.account_id ||
+        tokenRow.consumed !== 0 ||
+        tokenRow.course_id !== body.courseId ||
+        tokenRow.game_mode !== body.gameMode ||
+        tokenRow.difficulty !== body.difficulty
+      ) {
+        return jsonResp(
+          {
+            error: makeErrorPayload(
+              'RESULT_VERIFICATION_FAILED',
+              'رمز إثبات الجولة غير صالح أو تم استخدامه مسبقاً أو لا يطابق إعدادات الجولة.',
+            ),
+          },
+          422,
+        );
+      }
+
+      this.sql.exec(`UPDATE solo_run_tokens SET consumed = 1 WHERE token = ?`, token);
       const result = this.applyMatchForAccount(caller.account_id, body, nowMs);
       return jsonResp(result, 200);
     }
@@ -1825,6 +1938,7 @@ export class ProgressionController {
       const results: Record<string, { xpEarned: number; leveledUp: boolean }> = {};
       for (const item of participants.slice(0, 4)) {
         if (!item || typeof item.accountId !== 'string' || !item.match) continue;
+        if (!verifyMatchResult(item.match, { isAuthoritativeRoom: true }).ok) continue;
         try {
           const r = this.applyMatchForAccount(item.accountId, item.match, nowMs);
           results[item.accountId] = { xpEarned: r.xpEarned, leveledUp: r.leveledUp };

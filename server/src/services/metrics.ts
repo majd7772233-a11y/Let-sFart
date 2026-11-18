@@ -132,12 +132,16 @@ class OpsMetricsCollector {
     this.rejectedMatchesCount += 1;
   }
 
-  public saveFallbackReplay(replay: RoundReplayRecord): void {
+  public saveFallbackReplay(replay: RoundReplayRecord): boolean {
+    if (this.fallbackReplays.has(replay.matchId)) {
+      return false;
+    }
     this.fallbackReplays.set(replay.matchId, replay);
     if (this.fallbackReplays.size > MAX_FALLBACK_REPLAYS) {
       const oldestKey = this.fallbackReplays.keys().next().value;
       if (oldestKey) this.fallbackReplays.delete(oldestKey);
     }
+    return true;
   }
 
   public getFallbackReplay(matchId: string): RoundReplayRecord | null {
@@ -169,8 +173,9 @@ class OpsMetricsCollector {
     return list;
   }
 
-  public getFallbackAnalytics(): BalanceAnalyticsResponse {
+  public getFallbackAnalytics(filter?: { courseId?: CourseId; gameMode?: GameMode }): BalanceAnalyticsResponse {
     const courses: CourseBalanceStats[] = Array.from(this.fallbackBalanceMap.values())
+      .filter((c) => (!filter?.courseId || c.courseId === filter.courseId) && (!filter?.gameMode || c.gameMode === filter.gameMode))
       .map(({ totalClearTimeSec: _c, totalFalls: _f, totalCollisions: _col, totalItemsUsed: _it, ...rest }) => rest)
       .sort((a, b) => b.totalRuns - a.totalRuns);
     const totalVerifiedMatches = courses.reduce((s, c) => s + c.totalRuns, 0);
@@ -243,6 +248,9 @@ class OpsMetricsCollector {
       http5xxCount: this.http5xxCount,
       avgLatencyMs,
       p95LatencyMs,
+      metricsScope: 'isolate_local',
+      metricsNoteAr:
+        'عدادات الأداء والغرف النشطة تقريبية ومحلية لنسخة الـ Worker الحالية، بينما إحصاءات المباريات والتحليلات تُحفظ مركزياً في D1.',
       activeRooms,
     };
   }

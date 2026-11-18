@@ -25,6 +25,7 @@ import {
   ensureActiveAccountSession,
   equipCosmeticLook,
   extractProfileSnapshot,
+  fetchMyProfile,
   getStoredAccountToken,
   linkGuestToPermanentAccount,
   loginPermanentAccount,
@@ -33,6 +34,7 @@ import {
   registerPermanentAccount,
   removeFriendById,
   saveRoundReplay,
+  startSoloRun,
   updateMyProfile,
 } from './net/progressionClient.ts';
 import { getCourseById, isValidCourseId } from './shared/course.ts';
@@ -442,6 +444,22 @@ export default function App() {
     }
   }, [applyAuthSnapshot]);
 
+  const soloRunTokenRef = useRef<string | null>(null);
+
+  const requestSoloRunToken = useCallback(
+    async (courseId: CourseId, gameMode: GameMode, difficulty: GameDifficulty) => {
+      soloRunTokenRef.current = null;
+      try {
+        await ensureAccountReady();
+        const issued = await startSoloRun({ courseId, gameMode, difficulty });
+        soloRunTokenRef.current = issued.soloRunToken;
+      } catch {
+        soloRunTokenRef.current = null;
+      }
+    },
+    [ensureAccountReady],
+  );
+
   const submitMatchProgression = useCallback(
     async (simSnapshot: WorldSimulationState, slot: 0 | 1 | 2 | 3, submissionKey: string) => {
       if (submittedMatchKeysRef.current.has(submissionKey)) return;
@@ -449,7 +467,11 @@ export default function App() {
       try {
         await ensureAccountReady();
         const summary = buildMatchSummaryFromSim(simSnapshot, slot, submissionKey);
+        if (soloRunTokenRef.current) {
+          summary.soloRunToken = soloRunTokenRef.current;
+        }
         const reward = await recordAccountMatch(summary);
+        soloRunTokenRef.current = null;
         setLastMatchReward(reward);
         setProfileSnapshot(extractProfileSnapshot(reward));
         if (reward.rareEventTriggered && reward.rareEvent.titleAr) {
@@ -475,6 +497,11 @@ export default function App() {
     setLastMatchReward(null);
     setLastSoloReplay(null);
     setScreen('playing');
+    void requestSoloRunToken(
+      selectedCourseRef.current,
+      selectedGameModeRef.current,
+      selectedDifficultyRef.current,
+    );
     const prof = profileSnapshotRef.current?.profile;
     sceneRef.current?.startSoloGame(
       playerName,
@@ -488,7 +515,7 @@ export default function App() {
       },
       prof ? { accountId: prof.accountId, playerLevel: prof.level } : undefined,
     );
-  }, [playerName, cosmetic]);
+  }, [playerName, cosmetic, requestSoloRunToken]);
 
   const handleStartTutorial = useCallback(() => {
     const active = document.activeElement as HTMLElement | null;
@@ -543,6 +570,11 @@ export default function App() {
     } else {
       setScreen('playing');
       setLastSoloReplay(null);
+      void requestSoloRunToken(
+        selectedCourseRef.current,
+        selectedGameModeRef.current,
+        selectedDifficultyRef.current,
+      );
       const prof = profileSnapshotRef.current?.profile;
       sceneRef.current?.startSoloGame(
         playerName,
@@ -557,7 +589,7 @@ export default function App() {
         prof ? { accountId: prof.accountId, playerLevel: prof.level } : undefined,
       );
     }
-  }, [playerName, cosmetic]);
+  }, [playerName, cosmetic, requestSoloRunToken]);
 
   const handleLeaveRoom = useCallback(() => {
     if (roomSnapshotRef.current) {
@@ -965,7 +997,8 @@ export default function App() {
     };
   }, []);
 
-  // Submit online match reward deterministically when server lifecycle reaches FINISHED
+  // Online match rewards are recorded authoritatively by the RaftRoom server;
+  // refresh the player's profile snapshot once the round finishes.
   useEffect(() => {
     if (
       screen === 'gameover' &&
@@ -973,10 +1006,16 @@ export default function App() {
       roomSnapshot.lifecycleState === 'FINISHED' &&
       mySlot >= 0
     ) {
-      const roundKey = `online:${roomSnapshot.roomCode}:r${roomSnapshot.roundSeq ?? 1}`;
-      void submitMatchProgression(hud.sim, mySlot as 0 | 1 | 2 | 3, roundKey);
+      const timer = window.setTimeout(() => {
+        void fetchMyProfile()
+          .then((snap) => setProfileSnapshot(extractProfileSnapshot(snap)))
+          .catch(() => {
+            // non-fatal
+          });
+      }, 450);
+      return () => window.clearTimeout(timer);
     }
-  }, [screen, roomSnapshot, mySlot, hud.sim, submitMatchProgression]);
+  }, [screen, roomSnapshot, mySlot]);
 
   // Clear match reward banner if server starts a new round while modal was open
   useEffect(() => {
@@ -1317,6 +1356,7 @@ export default function App() {
       setLastMatchReward(null);
       setLastSoloReplay(null);
       setScreen('playing');
+      void requestSoloRunToken(courseId, gameMode, selectedDifficultyRef.current);
       const prof = profileSnapshotRef.current?.profile;
       sceneRef.current?.startSoloGame(
         playerNameRef.current,
@@ -1331,7 +1371,7 @@ export default function App() {
         prof ? { accountId: prof.accountId, playerLevel: prof.level } : undefined,
       );
     },
-    [],
+    [requestSoloRunToken],
   );
 
   const handleAddFriend = async (username: string) => {

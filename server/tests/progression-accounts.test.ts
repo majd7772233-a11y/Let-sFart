@@ -52,6 +52,17 @@ describe('PROG-01..05 Permanent Accounts, Profiles, Detailed Stats, Leaderboards
     expect(guestAuth.token.length).toBeGreaterThan(20);
 
     // 2. Record a match while still a guest
+    const tokRes1 = await routeWorkerRequest(
+      new Request('http://localhost/api/v1/progression/start-solo-run', {
+        method: 'POST',
+        headers: makeOriginHeaders(guestAuth.token),
+        body: JSON.stringify({ courseId: 'tropical', gameMode: 'standard', difficulty: 'normal' }),
+      }),
+      env,
+    );
+    expect(tokRes1.status).toBe(201);
+    const { soloRunToken: tok1 } = (await tokRes1.json()) as { soloRunToken: string };
+
     const match1: MatchSummaryInput = {
       submissionKey: 'solo:guest-test-1',
       courseId: 'tropical',
@@ -69,6 +80,7 @@ describe('PROG-01..05 Permanent Accounts, Profiles, Detailed Stats, Leaderboards
       hardGatesPassed: 3,
       minRaftHp: 90,
       isOnline: false,
+      soloRunToken: tok1,
     };
     const recRes = await routeWorkerRequest(
       new Request('http://localhost/api/v1/progression/record-match', {
@@ -248,9 +260,20 @@ describe('PROG-01..05 Permanent Accounts, Profiles, Detailed Stats, Leaderboards
     expect(p2Res.status).toBe(201);
     const p2 = (await p2Res.json()) as AuthHttpResponse;
 
+    const p1TokRes = await routeWorkerRequest(
+      new Request('http://localhost/api/v1/progression/start-solo-run', {
+        method: 'POST',
+        headers: makeOriginHeaders(p1.token),
+        body: JSON.stringify({ courseId: 'volcanic', gameMode: 'standard', difficulty: 'hard' }),
+      }),
+      env,
+    );
+    expect(p1TokRes.status).toBe(201);
+    const { soloRunToken: p1SoloTok } = (await p1TokRes.json()) as { soloRunToken: string };
+
     // P1 completes a volcanic run with 8 hard gates & fast time -> unlocks multiple achievements
     const p1Match: MatchSummaryInput = {
-      submissionKey: 'online:ROOM99:r1',
+      submissionKey: 'solo:ROOM99:r1',
       courseId: 'volcanic',
       gameMode: 'standard',
       difficulty: 'hard',
@@ -265,7 +288,8 @@ describe('PROG-01..05 Permanent Accounts, Profiles, Detailed Stats, Leaderboards
       harmonyCombos: 2,
       hardGatesPassed: 8,
       minRaftHp: 100,
-      isOnline: true,
+      isOnline: false,
+      soloRunToken: p1SoloTok,
     };
 
     const r1 = await routeWorkerRequest(
@@ -300,6 +324,15 @@ describe('PROG-01..05 Permanent Accounts, Profiles, Detailed Stats, Leaderboards
     expect(replayData.profile.xp).toBe(rec1.profile.xp);
 
     // P2 finishes slower volcanic run + defeat survival run
+    const p2TokRes = await routeWorkerRequest(
+      new Request('http://localhost/api/v1/progression/start-solo-run', {
+        method: 'POST',
+        headers: makeOriginHeaders(p2.token),
+        body: JSON.stringify({ courseId: 'volcanic', gameMode: 'standard', difficulty: 'hard' }),
+      }),
+      env,
+    );
+    const { soloRunToken: p2SoloTok } = (await p2TokRes.json()) as { soloRunToken: string };
     await routeWorkerRequest(
       new Request('http://localhost/api/v1/progression/record-match', {
         method: 'POST',
@@ -310,6 +343,7 @@ describe('PROG-01..05 Permanent Accounts, Profiles, Detailed Stats, Leaderboards
           elapsedTimeSec: 54.0,
           falls: 1,
           hardGatesPassed: 2,
+          soloRunToken: p2SoloTok,
         }),
       }),
       env,
@@ -470,6 +504,15 @@ describe('PROG-01..05 Permanent Accounts, Profiles, Detailed Stats, Leaderboards
     let lastRec!: RecordMatchHttpResponse;
     let sawRareTrigger = false;
     for (let i = 1; i <= 7; i += 1) {
+      const loopTokRes = await routeWorkerRequest(
+        new Request('http://localhost/api/v1/progression/start-solo-run', {
+          method: 'POST',
+          headers: makeOriginHeaders(auth.token),
+          body: JSON.stringify({ courseId: 'storm', gameMode: 'treasure', difficulty: 'hard' }),
+        }),
+        env,
+      );
+      const { soloRunToken: loopTok } = (await loopTokRes.json()) as { soloRunToken: string };
       const recRes = await routeWorkerRequest(
         new Request('http://localhost/api/v1/progression/record-match', {
           method: 'POST',
@@ -493,6 +536,7 @@ describe('PROG-01..05 Permanent Accounts, Profiles, Detailed Stats, Leaderboards
             cleanCheckpoints: 3,
             collisionCount: 0,
             isOnline: false,
+            soloRunToken: loopTok,
           }),
         }),
         env,

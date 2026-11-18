@@ -148,6 +148,7 @@ export class PartyController {
   private sockets = new Map<WebSocket, SocketBinding>();
   private rateLimiter = new SessionRateLimiter();
   private inFlightJoinCount = 0;
+  private rotatingMembers = new Set<string>();
 
   constructor(ctx: DurableObjectState, sql: SqlStorageAdapter) {
     this.ctx = ctx;
@@ -601,67 +602,112 @@ export class PartyController {
         return;
       }
 
-      if (!(await verifyTokenHash(resumeToken, member.resumeTokenHash))) {
-        this.sendMsg(ws, makeEnvelope('party:error', makeErrorPayload('UNAUTHORIZED', undefined, 'party:authenticate'), reqId));
+      const lockKey = `${this.party.partyCode}:${member.memberId}`;
+      if (this.rotatingMembers.has(lockKey)) {
+        this.sendMsg(
+          ws,
+          makeEnvelope(
+            'party:error',
+            makeErrorPayload('UNAUTHORIZED', 'عملية المصادقة قيد التنفيذ بالفعل، يرجى المحاولة مجدداً.', 'party:authenticate'),
+            reqId,
+          ),
+        );
         return;
       }
 
-      // Close previous socket for same member cleanly
-      for (const candidate of this.sockets.values()) {
-        if (candidate.ws !== ws && candidate.authenticated && candidate.playerId === member.memberId) {
-          candidate.authenticated = false;
-          candidate.playerId = null;
-          writeAttachment(candidate.ws, {
-            authenticated: false,
-            playerId: null,
-            sessionId: null,
-            connectionEpoch: 0,
-            kind: 'party',
-          });
-          try {
-            candidate.ws.close(4001, 'SESSION_REPLACED');
-          } catch {
-            // ignore
+      const expectedHash = member.resumeTokenHash;
+      const expectedEpoch = member.connectionEpoch;
+      this.rotatingMembers.add(lockKey);
+
+      try {
+        const valid = await verifyTokenHash(resumeToken, expectedHash);
+        if (!valid) {
+          this.sendMsg(ws, makeEnvelope('party:error', makeErrorPayload('UNAUTHORIZED', undefined, 'party:authenticate'), reqId));
+          return;
+        }
+
+        const newToken = generateResumeToken();
+        const newTokenHash = await hashToken(newToken);
+
+        // Atomic Compare-And-Swap guard across async boundaries
+        if (
+          !this.party ||
+          member.revoked ||
+          member.resumeTokenHash !== expectedHash ||
+          member.connectionEpoch !== expectedEpoch
+        ) {
+          this.sendMsg(
+            ws,
+            makeEnvelope(
+              'party:error',
+              makeErrorPayload('UNAUTHORIZED', 'انتهت صلاحية رمز الاستعادة أو تم استبداله.', 'party:authenticate'),
+              reqId,
+            ),
+          );
+          return;
+        }
+
+        // Close previous socket for same member cleanly
+        for (const candidate of this.sockets.values()) {
+          if (candidate.ws !== ws && candidate.authenticated && candidate.playerId === member.memberId) {
+            candidate.authenticated = false;
+            candidate.playerId = null;
+            candidate.sessionId = null;
+            candidate.connectionEpoch = 0;
+            writeAttachment(candidate.ws, {
+              authenticated: false,
+              playerId: null,
+              sessionId: null,
+              connectionEpoch: 0,
+              kind: 'party',
+            });
+            try {
+              candidate.ws.close(4001, 'SESSION_REPLACED');
+            } catch {
+              // ignore
+            }
           }
         }
+
+        member.resumeTokenHash = newTokenHash;
+        member.sessionId = makeUuid();
+        member.connectionEpoch += 1;
+        member.connected = true;
+        member.lastSeenAt = nowMs;
+
+        binding.authenticated = true;
+        binding.playerId = member.memberId;
+        binding.sessionId = member.sessionId;
+        binding.connectionEpoch = member.connectionEpoch;
+        binding.authAttempts = 0;
+        writeAttachment(ws, this.toAttachment(binding));
+
+        this.saveMember(member);
+
+        this.sendMsg(
+          ws,
+          makeEnvelope(
+            'party:renewed',
+            {
+              partyCode: this.party.partyCode,
+              memberId: member.memberId,
+              sessionId: member.sessionId,
+              resumeToken: newToken,
+              connectionEpoch: member.connectionEpoch,
+              isLeader: member.memberId === this.party.leaderId,
+            },
+            reqId,
+          ),
+        );
+
+        this.broadcastMsg(makeEnvelope('party:state', { party: this.buildState(this.party) }));
+        return;
+      } finally {
+        this.rotatingMembers.delete(lockKey);
       }
-
-      const newToken = generateResumeToken();
-      member.resumeTokenHash = await hashToken(newToken);
-      member.connectionEpoch += 1;
-      member.connected = true;
-      member.lastSeenAt = nowMs;
-
-      binding.authenticated = true;
-      binding.playerId = member.memberId;
-      binding.sessionId = member.sessionId;
-      binding.connectionEpoch = member.connectionEpoch;
-      binding.authAttempts = 0;
-      writeAttachment(ws, this.toAttachment(binding));
-
-      this.saveMember(member);
-
-      this.sendMsg(
-        ws,
-        makeEnvelope(
-          'party:renewed',
-          {
-            partyCode: this.party.partyCode,
-            memberId: member.memberId,
-            sessionId: member.sessionId,
-            resumeToken: newToken,
-            connectionEpoch: member.connectionEpoch,
-            isLeader: member.memberId === this.party.leaderId,
-          },
-          reqId,
-        ),
-      );
-
-      this.broadcastMsg(makeEnvelope('party:state', { party: this.buildState(this.party) }));
-      return;
     }
 
-    if (!binding.authenticated || !binding.playerId) {
+    if (!binding.authenticated || !binding.playerId || !binding.sessionId) {
       this.sendMsg(ws, makeEnvelope('party:error', makeErrorPayload('UNAUTHORIZED', undefined, msg.type), reqId));
       return;
     }
@@ -669,6 +715,15 @@ export class PartyController {
     const member = this.party.members.get(binding.playerId);
     if (!member || member.revoked || nowMs >= member.expiresAt) {
       this.sendMsg(ws, makeEnvelope('party:error', makeErrorPayload('SESSION_EXPIRED', undefined, msg.type), reqId));
+      return;
+    }
+    if (member.sessionId !== binding.sessionId || member.connectionEpoch !== binding.connectionEpoch) {
+      this.sendMsg(ws, makeEnvelope('party:error', makeErrorPayload('SESSION_REPLACED', undefined, msg.type), reqId));
+      try {
+        ws.close(4001, 'SESSION_REPLACED');
+      } catch {
+        // ignore
+      }
       return;
     }
     member.lastSeenAt = nowMs;

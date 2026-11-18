@@ -742,6 +742,7 @@ export interface MatchSummaryInput {
   cleanCheckpoints?: number;
   collisionCount?: number;
   isOnline: boolean;
+  soloRunToken?: string;
 }
 
 // ==========================================
@@ -1057,6 +1058,8 @@ export interface ServerHealthSnapshot {
   http5xxCount: number;
   avgLatencyMs: number;
   p95LatencyMs: number;
+  metricsScope?: 'isolate_local' | 'global';
+  metricsNoteAr?: string;
   activeRooms: RoomOpsMetricsSummary[];
 }
 

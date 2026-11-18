@@ -1279,17 +1279,21 @@ export class RaftRoom {
         if (p.tempBotSubstitute) tempSubstituteCount += 1;
         else if (p.isBot && p.connected) botCount += 1;
       }
-      opsMetrics.updateRoomSummary({
-        roomCode: room.roomCode,
-        courseId: room.courseId,
-        gameMode: room.settings.gameMode,
-        lifecycleState: room.lifecycleState,
-        humanCount,
-        botCount,
-        tempSubstituteCount,
-        spectatorCount,
-        updatedAt: Date.now(),
-      });
+      if (room.isPrivate) {
+        opsMetrics.removeRoom(room.roomCode);
+      } else {
+        opsMetrics.updateRoomSummary({
+          roomCode: room.roomCode,
+          courseId: room.courseId,
+          gameMode: room.settings.gameMode,
+          lifecycleState: room.lifecycleState,
+          humanCount,
+          botCount,
+          tempSubstituteCount,
+          spectatorCount,
+          updatedAt: Date.now(),
+        });
+      }
     }
 
     if (!this.env?.ROOMS) return;
@@ -1403,16 +1407,19 @@ export class RaftRoom {
         verifiedAt: nowMs,
       };
       jobs.push(recordVerifiedMatchInD1(this.env?.DB, verifiedRecord));
+
+      if (replayRecord.frames.length > 0) {
+        jobs.push(saveRoundReplayInD1(this.env?.DB, replayRecord));
+      }
+
+      const verifiedParticipants = participants.filter(
+        (p) => verifyMatchResult(p.match, { isAuthoritativeRoom: true }).ok,
+      );
+      if (this.env?.ROOMS && verifiedParticipants.length > 0) {
+        jobs.push(recordOnlineBatchViaService(this.env, verifiedParticipants));
+      }
     } else {
       opsMetrics.recordVerificationRejection();
-    }
-
-    if (replayRecord.frames.length > 0) {
-      jobs.push(saveRoundReplayInD1(this.env?.DB, replayRecord));
-    }
-
-    if (this.env?.ROOMS && participants.length > 0) {
-      jobs.push(recordOnlineBatchViaService(this.env, participants));
     }
 
     if (jobs.length === 0) return;

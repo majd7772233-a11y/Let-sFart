@@ -81,10 +81,23 @@ const D1_DDL_STATEMENTS = [
   )`,
 ];
 
+const schemaInitPromises = new WeakMap<D1DatabaseLike, Promise<void>>();
+
 export async function ensureD1Schema(db: D1DatabaseLike): Promise<void> {
   if (initializedDbs.has(db)) return;
-  await db.batch(D1_DDL_STATEMENTS.map((sql) => db.prepare(sql)));
-  initializedDbs.add(db);
+  let pending = schemaInitPromises.get(db);
+  if (!pending) {
+    pending = db
+      .batch(D1_DDL_STATEMENTS.map((sql) => db.prepare(sql)))
+      .then(() => {
+        initializedDbs.add(db);
+      })
+      .finally(() => {
+        schemaInitPromises.delete(db);
+      });
+    schemaInitPromises.set(db, pending);
+  }
+  await pending;
 }
 
 /**
@@ -102,72 +115,72 @@ export async function recordVerifiedMatchInD1(
   }
 
   await ensureD1Schema(db);
-  const existing = await db
-    .prepare(`SELECT submission_key FROM d1_verified_matches WHERE submission_key = ?`)
-    .bind(record.submissionKey)
-    .first<{ submission_key: string }>();
 
-  if (existing) {
+  // Atomically insert the verified match first; SQLite PRIMARY KEY on submission_key
+  // guarantees that under concurrent duplicate requests only ONE call gets changes === 1.
+  const insertRes = await db
+    .prepare(
+      `INSERT OR IGNORE INTO d1_verified_matches (
+        submission_key, match_id, room_code, account_id, mode, course_id, game_mode,
+        difficulty, outcome, elapsed_time_sec, falls, items_used, collision_count,
+        treasure_score, survival_distance, min_raft_hp, verified_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .bind(
+      record.submissionKey,
+      record.matchId,
+      record.roomCode,
+      record.accountId,
+      record.mode,
+      record.courseId,
+      record.gameMode,
+      record.difficulty,
+      record.outcome,
+      record.elapsedTimeSec,
+      record.falls,
+      record.itemsUsed,
+      record.collisionCount,
+      record.treasureScore,
+      record.survivalDistance,
+      record.minRaftHp,
+      record.verifiedAt,
+    )
+    .run();
+
+  const changes = Number((insertRes as { meta?: { changes?: number } })?.meta?.changes ?? 0);
+  if (changes <= 0) {
     return { inserted: false };
   }
 
   const isWin = record.outcome === 'victory' ? 1 : 0;
   const clearTimeContribution = isWin ? record.elapsedTimeSec : 0;
 
-  await db.batch([
-    db
-      .prepare(
-        `INSERT OR IGNORE INTO d1_verified_matches (
-          submission_key, match_id, room_code, account_id, mode, course_id, game_mode,
-          difficulty, outcome, elapsed_time_sec, falls, items_used, collision_count,
-          treasure_score, survival_distance, min_raft_hp, verified_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .bind(
-        record.submissionKey,
-        record.matchId,
-        record.roomCode,
-        record.accountId,
-        record.mode,
-        record.courseId,
-        record.gameMode,
-        record.difficulty,
-        record.outcome,
-        record.elapsedTimeSec,
-        record.falls,
-        record.itemsUsed,
-        record.collisionCount,
-        record.treasureScore,
-        record.survivalDistance,
-        record.minRaftHp,
-        record.verifiedAt,
-      ),
-    db
-      .prepare(
-        `INSERT INTO d1_course_balance_rollups (
-          course_id, game_mode, total_runs, wins, total_clear_time_sec,
-          total_falls, total_collisions, total_items_used, last_updated_at
-        ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(course_id, game_mode) DO UPDATE SET
-          total_runs = total_runs + 1,
-          wins = wins + excluded.wins,
-          total_clear_time_sec = total_clear_time_sec + excluded.total_clear_time_sec,
-          total_falls = total_falls + excluded.total_falls,
-          total_collisions = total_collisions + excluded.total_collisions,
-          total_items_used = total_items_used + excluded.total_items_used,
-          last_updated_at = excluded.last_updated_at`,
-      )
-      .bind(
-        record.courseId,
-        record.gameMode,
-        isWin,
-        clearTimeContribution,
-        record.falls,
-        record.collisionCount,
-        record.itemsUsed,
-        record.verifiedAt,
-      ),
-  ]);
+  await db
+    .prepare(
+      `INSERT INTO d1_course_balance_rollups (
+        course_id, game_mode, total_runs, wins, total_clear_time_sec,
+        total_falls, total_collisions, total_items_used, last_updated_at
+      ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(course_id, game_mode) DO UPDATE SET
+        total_runs = total_runs + 1,
+        wins = wins + excluded.wins,
+        total_clear_time_sec = total_clear_time_sec + excluded.total_clear_time_sec,
+        total_falls = total_falls + excluded.total_falls,
+        total_collisions = total_collisions + excluded.total_collisions,
+        total_items_used = total_items_used + excluded.total_items_used,
+        last_updated_at = excluded.last_updated_at`,
+    )
+    .bind(
+      record.courseId,
+      record.gameMode,
+      isWin,
+      clearTimeContribution,
+      record.falls,
+      record.collisionCount,
+      record.itemsUsed,
+      record.verifiedAt,
+    )
+    .run();
 
   return { inserted: true };
 }
@@ -175,22 +188,30 @@ export async function recordVerifiedMatchInD1(
 export async function saveRoundReplayInD1(
   db: D1DatabaseLike | undefined,
   replay: RoundReplayRecord,
-): Promise<void> {
-  opsMetrics.saveFallbackReplay(replay);
-  if (!db) return;
+): Promise<{ inserted: boolean }> {
+  if (!db) {
+    const inserted = opsMetrics.saveFallbackReplay(replay);
+    return { inserted };
+  }
 
   await ensureD1Schema(db);
+  const existing = await db
+    .prepare(`SELECT match_id FROM d1_round_replays WHERE match_id = ?`)
+    .bind(replay.matchId)
+    .first<{ match_id: string }>();
+
+  if (existing) {
+    return { inserted: false };
+  }
+
+  opsMetrics.saveFallbackReplay(replay);
   await db
     .prepare(
-      `INSERT INTO d1_round_replays (
+      `INSERT OR IGNORE INTO d1_round_replays (
         match_id, room_code, mode, course_id, game_mode, difficulty, outcome,
         duration_sec, falls, treasure_score, survival_distance,
         frame_count, event_count, replay_json, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(match_id) DO UPDATE SET
-        replay_json = excluded.replay_json,
-        frame_count = excluded.frame_count,
-        event_count = excluded.event_count`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .bind(
       replay.matchId,
@@ -210,6 +231,8 @@ export async function saveRoundReplayInD1(
       replay.createdAt,
     )
     .run();
+
+  return { inserted: true };
 }
 
 export async function listRoundReplaysFromD1(
@@ -307,30 +330,42 @@ export async function getRoundReplayFromD1(
 
 export async function getBalanceAnalyticsFromD1(
   db: D1DatabaseLike | undefined,
+  filter?: { courseId?: CourseId; gameMode?: GameMode },
 ): Promise<BalanceAnalyticsResponse> {
   if (!db) {
-    return opsMetrics.getFallbackAnalytics();
+    return opsMetrics.getFallbackAnalytics(filter);
   }
 
   await ensureD1Schema(db);
-  const rows = await db
-    .prepare(
-      `SELECT course_id, game_mode, total_runs, wins, total_clear_time_sec,
-              total_falls, total_collisions, total_items_used, last_updated_at
-       FROM d1_course_balance_rollups
-       ORDER BY total_runs DESC, last_updated_at DESC`,
-    )
-    .all<{
-      course_id: CourseId;
-      game_mode: GameMode;
-      total_runs: number;
-      wins: number;
-      total_clear_time_sec: number;
-      total_falls: number;
-      total_collisions: number;
-      total_items_used: number;
-      last_updated_at: number;
-    }>();
+  const clauses: string[] = [];
+  const bindings: unknown[] = [];
+  if (filter?.courseId) {
+    clauses.push(`course_id = ?`);
+    bindings.push(filter.courseId);
+  }
+  if (filter?.gameMode) {
+    clauses.push(`game_mode = ?`);
+    bindings.push(filter.gameMode);
+  }
+  const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+  const stmt = db.prepare(
+    `SELECT course_id, game_mode, total_runs, wins, total_clear_time_sec,
+            total_falls, total_collisions, total_items_used, last_updated_at
+     FROM d1_course_balance_rollups
+     ${where}
+     ORDER BY total_runs DESC, last_updated_at DESC`,
+  );
+  const rows = await (bindings.length > 0 ? stmt.bind(...bindings) : stmt).all<{
+    course_id: CourseId;
+    game_mode: GameMode;
+    total_runs: number;
+    wins: number;
+    total_clear_time_sec: number;
+    total_falls: number;
+    total_collisions: number;
+    total_items_used: number;
+    last_updated_at: number;
+  }>();
 
   const courses: CourseBalanceStats[] = rows.results.map((r) => {
     const runs = Math.max(1, r.total_runs);

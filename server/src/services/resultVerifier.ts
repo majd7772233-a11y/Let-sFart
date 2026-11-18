@@ -165,6 +165,57 @@ export function verifyMatchResult(
     };
   }
 
+  const maxHardGates =
+    raw.gameMode === 'survival'
+      ? Math.max(course.movingGates.length * 2, Math.ceil(elapsed / 6) + 6)
+      : Math.max(course.movingGates.length * 2, 12);
+  const hardGatesPassed = raw.hardGatesPassed ?? 0;
+  if (
+    typeof hardGatesPassed !== 'number' ||
+    !Number.isInteger(hardGatesPassed) ||
+    hardGatesPassed < 0 ||
+    hardGatesPassed > Math.min(80, maxHardGates)
+  ) {
+    return {
+      ok: false,
+      reasonCode: 'IMPLAUSIBLE_HARD_GATES',
+      reasonAr: 'عدد البوابات الصعبة المجتازة يتجاوز حدود المسار.',
+    };
+  }
+
+  const maxCleanCheckpoints =
+    raw.gameMode === 'survival'
+      ? Math.max(course.checkpoints.length, Math.ceil(elapsed / 8) + 4)
+      : Math.max(1, course.checkpoints.length);
+  const cleanCheckpoints = raw.cleanCheckpoints ?? 0;
+  if (
+    typeof cleanCheckpoints !== 'number' ||
+    !Number.isInteger(cleanCheckpoints) ||
+    cleanCheckpoints < 0 ||
+    cleanCheckpoints > maxCleanCheckpoints
+  ) {
+    return {
+      ok: false,
+      reasonCode: 'IMPLAUSIBLE_CLEAN_CHECKPOINTS',
+      reasonAr: 'عدد نقاط الحفظ النظيفة يتجاوز عدد نقاط المسار.',
+    };
+  }
+
+  const harmonyCombos = raw.harmonyCombos ?? 0;
+  const maxHarmonyCombos = Math.max(4, Math.ceil(elapsed / 2.2) + 2);
+  if (
+    typeof harmonyCombos !== 'number' ||
+    !Number.isInteger(harmonyCombos) ||
+    harmonyCombos < 0 ||
+    harmonyCombos > Math.min(120, maxHarmonyCombos)
+  ) {
+    return {
+      ok: false,
+      reasonCode: 'IMPLAUSIBLE_HARMONY_COMBOS',
+      reasonAr: 'عدد تناغمات النفخة الخارقة يتجاوز الممكن خلال مدة الجولة.',
+    };
+  }
+
   if (options?.isAuthoritativeRoom && raw.gameMode === 'treasure' && treasureScore > MAX_COINS_PER_ROUND * 20) {
     warnings.push('AUTHORITATIVE_HIGH_TREASURE_SCORE');
   } else if (raw.gameMode === 'treasure' && treasureScore > MAX_COINS_PER_ROUND * 20) {
@@ -173,3 +224,106 @@ export function verifyMatchResult(
 
   return { ok: true, warnings };
 }
+
+const VALID_REPLAY_EVENT_TYPES = new Set([
+  'collision',
+  'hazard_hit',
+  'checkpoint',
+  'fall',
+  'pickup',
+  'super_fart',
+  'shield_block',
+  'shockwave',
+  'lightning',
+  'finish',
+  'chaos_shift',
+  'coin',
+]);
+
+export function validateReplayPayload(
+  candidate: Record<string, unknown>,
+): { ok: true } | { ok: false; reasonAr: string } {
+  const frames = candidate.frames;
+  if (!Array.isArray(frames) || frames.length === 0 || frames.length > 480) {
+    return { ok: false, reasonAr: 'إطارات الإعادة غير صالحة أو فارغة.' };
+  }
+
+  let prevT = -1;
+  for (let i = 0; i < frames.length; i++) {
+    const f = frames[i] as Record<string, unknown> | null;
+    if (!f || typeof f !== 'object') {
+      return { ok: false, reasonAr: 'تنسيق أحد إطارات الإعادة غير صالح.' };
+    }
+    const numFields = ['t', 'x', 'z', 'yaw', 'progress', 'raftHp', 'harmony', 'windX'] as const;
+    for (const k of numFields) {
+      const v = f[k];
+      if (typeof v !== 'number' || !Number.isFinite(v)) {
+        return { ok: false, reasonAr: `قيمة رقمية غير صالحة (${k}) في إطار الإعادة.` };
+      }
+    }
+    if ((f.t as number) < prevT || (f.t as number) < 0 || (f.t as number) > 36_000) {
+      return { ok: false, reasonAr: 'تسلسل زمن إطارات الإعادة غير منطقي.' };
+    }
+    if ((f.raftHp as number) < 0 || (f.raftHp as number) > 100) {
+      return { ok: false, reasonAr: 'قيمة متانة الطوف في الإعادة خارج النطاق.' };
+    }
+    if ((f.progress as number) < 0 || (f.progress as number) > 1.05) {
+      return { ok: false, reasonAr: 'نسبة التقدم في الإعادة خارج النطاق.' };
+    }
+    prevT = f.t as number;
+  }
+
+  const players = candidate.players;
+  if (players !== undefined) {
+    if (!Array.isArray(players) || players.length > 4) {
+      return { ok: false, reasonAr: 'قائمة لاعبي الإعادة غير صالحة.' };
+    }
+    for (const p of players) {
+      if (!p || typeof p !== 'object') {
+        return { ok: false, reasonAr: 'بيانات أحد اللاعبين في الإعادة غير صالحة.' };
+      }
+      const pr = p as Record<string, unknown>;
+      if (
+        typeof pr.slot !== 'number' ||
+        !Number.isInteger(pr.slot) ||
+        pr.slot < 0 ||
+        pr.slot > 3 ||
+        typeof pr.name !== 'string' ||
+        pr.name.length === 0 ||
+        pr.name.length > 40 ||
+        typeof pr.isBot !== 'boolean'
+      ) {
+        return { ok: false, reasonAr: 'حقول اللاعب في الإعادة غير مكتملة أو غير صالحة.' };
+      }
+    }
+  }
+
+  const events = candidate.events;
+  if (events !== undefined) {
+    if (!Array.isArray(events) || events.length > 160) {
+      return { ok: false, reasonAr: 'قائمة أحداث الإعادة غير صالحة.' };
+    }
+    for (const ev of events) {
+      if (!ev || typeof ev !== 'object') {
+        return { ok: false, reasonAr: 'تنسيق أحد أحداث الإعادة غير صالح.' };
+      }
+      const er = ev as Record<string, unknown>;
+      if (
+        typeof er.t !== 'number' ||
+        !Number.isFinite(er.t) ||
+        er.t < 0 ||
+        typeof er.x !== 'number' ||
+        !Number.isFinite(er.x) ||
+        typeof er.z !== 'number' ||
+        !Number.isFinite(er.z) ||
+        typeof er.type !== 'string' ||
+        !VALID_REPLAY_EVENT_TYPES.has(er.type)
+      ) {
+        return { ok: false, reasonAr: 'حدث غير صالح داخل بيانات الإعادة.' };
+      }
+    }
+  }
+
+  return { ok: true };
+}
+

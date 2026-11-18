@@ -31,6 +31,7 @@ import {
 import { isOriginAllowed, resolveCorsAllowOrigin, type Env } from './env.ts';
 import { logServerEvent } from './lib/logger.ts';
 import { extractClientIpKey, HttpIpRateLimiter, type HttpRateChannel } from './lib/rateLimit.ts';
+import { constantTimeEqual } from './lib/tokens.ts';
 import { isRecord, readBoundedJson } from './lib/validation.ts';
 import { makeErrorPayload, ProtocolError } from './protocol/errors.ts';
 import { opsMetrics } from './services/metrics.ts';
@@ -40,8 +41,8 @@ import {
   getPartyInfoViaService,
   joinPartyViaService,
 } from './services/partyService.ts';
-import { forwardProgressionRequest } from './services/progressionService.ts';
-import { verifyMatchResult } from './services/resultVerifier.ts';
+import { forwardProgressionRequest, resolveAccountTokenViaService } from './services/progressionService.ts';
+import { validateReplayPayload, verifyMatchResult } from './services/resultVerifier.ts';
 import {
   consumeDurableHttpRateLimit,
   createRoomViaService,
@@ -67,6 +68,22 @@ async function checkEdgeRateLimit(env: Env, channel: HttpRateChannel, ipKey: str
     if (!res.success) {
       return false;
     }
+  }
+  return true;
+}
+
+async function checkPersistentEdgeRateLimit(
+  env: Env,
+  channel: 'create' | 'join',
+  actionScope: string,
+  subjectKey: string,
+): Promise<boolean> {
+  const scopedKey = `${actionScope}:${subjectKey}`;
+  if (!(await checkEdgeRateLimit(env, channel, scopedKey))) {
+    return false;
+  }
+  if (!env.RATE_LIMITER && !(await consumeDurableHttpRateLimit(env, channel, scopedKey))) {
+    return false;
   }
   return true;
 }
@@ -149,12 +166,22 @@ function checkProtocolCompatibility(
   return { ok: true };
 }
 
-function isOpsAuthorized(request: Request, url: URL, env: Env): boolean {
+function isOpsAuthorized(request: Request, env: Env): boolean {
   const configuredKey = env.OPS_ADMIN_KEY?.trim();
-  if (!configuredKey) return true;
+  const isLocalDev =
+    env.ENVIRONMENT === 'local-node' ||
+    env.ENVIRONMENT === 'development' ||
+    env.ENVIRONMENT === 'test';
+
+  if (!configuredKey) {
+    // Fail closed in production when OPS_ADMIN_KEY is not configured
+    return isLocalDev;
+  }
+
+  // Header-only authentication (never accept secrets in query string)
   const headerKey = (request.headers.get('x-admin-key') ?? request.headers.get('x-ops-key'))?.trim();
-  const queryKey = (url.searchParams.get('adminKey') ?? url.searchParams.get('opsKey'))?.trim();
-  return headerKey === configuredKey || queryKey === configuredKey;
+  if (!headerKey) return false;
+  return constantTimeEqual(headerKey, configuredKey);
 }
 
 async function handleWorkerRouteInner(request: Request, env: Env): Promise<Response> {
@@ -348,7 +375,7 @@ async function handleWorkerRouteInner(request: Request, env: Env): Promise<Respo
 
     // Party Create: POST /api/v1/parties
     if (path === '/api/v1/parties' && request.method === 'POST') {
-      if (!(await checkEdgeRateLimit(env, 'create', ipKey))) {
+      if (!(await checkPersistentEdgeRateLimit(env, 'create', 'party_create', ipKey))) {
         return jsonResp({ error: makeErrorPayload('RATE_LIMITED') }, 429, request, env);
       }
       const bodyResult = await readBoundedJson(request, 2048);
@@ -366,7 +393,7 @@ async function handleWorkerRouteInner(request: Request, env: Env): Promise<Respo
     // Party Join: POST /api/v1/parties/:code/join
     const partyJoinMatch = path.match(/^\/api\/v1\/parties\/([^/]+)\/join$/);
     if (partyJoinMatch && request.method === 'POST') {
-      if (!(await checkEdgeRateLimit(env, 'join', ipKey))) {
+      if (!(await checkPersistentEdgeRateLimit(env, 'join', 'party_join', ipKey))) {
         return jsonResp({ error: makeErrorPayload('RATE_LIMITED') }, 429, request, env);
       }
       const bodyResult = await readBoundedJson(request, 2048);
@@ -405,7 +432,7 @@ async function handleWorkerRouteInner(request: Request, env: Env): Promise<Respo
     // ==========================================
 
     if (path === '/api/v1/auth/guest' && request.method === 'POST') {
-      if (!(await checkEdgeRateLimit(env, 'create', ipKey))) {
+      if (!(await checkPersistentEdgeRateLimit(env, 'create', 'auth_guest', ipKey))) {
         return jsonResp({ error: makeErrorPayload('RATE_LIMITED') }, 429, request, env);
       }
       const doRes = await forwardProgressionRequest(env, '/internal/prog/guest', request);
@@ -479,9 +506,17 @@ async function handleWorkerRouteInner(request: Request, env: Env): Promise<Respo
       return withCors(doRes, request, env);
     }
 
+    if (path === '/api/v1/progression/start-solo-run' && request.method === 'POST') {
+      if (!(await checkPersistentEdgeRateLimit(env, 'join', 'solo_start', ipKey))) {
+        return jsonResp({ error: makeErrorPayload('RATE_LIMITED') }, 429, request, env);
+      }
+      const doRes = await forwardProgressionRequest(env, '/internal/prog/start-solo-run', request);
+      return withCors(doRes, request, env);
+    }
+
     // TECH-01 & TECH-03: Authoritative Result Verification before recording progression & D1 analytics
     if (path === '/api/v1/progression/record-match' && request.method === 'POST') {
-      if (!(await checkEdgeRateLimit(env, 'join', ipKey))) {
+      if (!(await checkPersistentEdgeRateLimit(env, 'join', 'record_match', ipKey))) {
         return jsonResp({ error: makeErrorPayload('RATE_LIMITED') }, 429, request, env);
       }
       const bodyResult = await readBoundedJson(request.clone(), 8192);
@@ -489,6 +524,20 @@ async function handleWorkerRouteInner(request: Request, env: Env): Promise<Respo
         return jsonResp({ error: makeErrorPayload(bodyResult.code) }, bodyResult.status, request, env);
       }
       const rawBody = isRecord(bodyResult.data) ? (bodyResult.data as Partial<MatchSummaryInput>) : {};
+      if (rawBody.isOnline === true) {
+        opsMetrics.recordVerificationRejection();
+        return jsonResp(
+          {
+            error: makeErrorPayload(
+              'RESULT_VERIFICATION_FAILED',
+              'نتائج الجولات الجماعية تُوثّق من الخادم فقط.',
+            ),
+          },
+          403,
+          request,
+          env,
+        );
+      }
       const verification = verifyMatchResult(rawBody, { isAuthoritativeRoom: false });
       if (!verification.ok) {
         opsMetrics.recordVerificationRejection();
@@ -628,7 +677,7 @@ async function handleWorkerRouteInner(request: Request, env: Env): Promise<Respo
     // ==========================================
 
     if (path === '/api/v1/replays' && request.method === 'POST') {
-      if (!(await checkEdgeRateLimit(env, 'join', ipKey))) {
+      if (!(await checkPersistentEdgeRateLimit(env, 'join', 'replay_upload_ip', ipKey))) {
         return jsonResp({ error: makeErrorPayload('RATE_LIMITED') }, 429, request, env);
       }
       const bodyResult = await readBoundedJson(request, 128_000);
@@ -636,18 +685,45 @@ async function handleWorkerRouteInner(request: Request, env: Env): Promise<Respo
         return jsonResp({ error: makeErrorPayload(bodyResult.code) }, bodyResult.status, request, env);
       }
       const data = isRecord(bodyResult.data) ? bodyResult.data : {};
+      const accountToken = extractAccountToken(request, data);
+      const account = await resolveAccountTokenViaService(env, accountToken);
+      if (!account) {
+        return jsonResp(
+          { error: makeErrorPayload('UNAUTHORIZED', 'يجب تسجيل الدخول لحفظ إعادة الجولة.') },
+          401,
+          request,
+          env,
+        );
+      }
+      if (!(await checkPersistentEdgeRateLimit(env, 'join', 'replay_upload_acct', account.accountId))) {
+        return jsonResp({ error: makeErrorPayload('RATE_LIMITED') }, 429, request, env);
+      }
+
       const candidate = (isRecord(data.replay) ? data.replay : data) as Partial<RoundReplayRecord>;
+      const rawMatchId = typeof candidate.matchId === 'string' ? candidate.matchId.trim() : '';
       if (
-        typeof candidate.matchId !== 'string' ||
-        candidate.matchId.trim().length < 3 ||
+        rawMatchId.length < 3 ||
         !isValidCourseId(candidate.courseId) ||
         !isValidGameMode(candidate.gameMode) ||
         !isValidDifficulty(candidate.difficulty) ||
-        (candidate.outcome !== 'victory' && candidate.outcome !== 'defeat') ||
-        !Array.isArray(candidate.frames) ||
-        candidate.frames.length === 0
+        (candidate.outcome !== 'victory' && candidate.outcome !== 'defeat')
       ) {
         return jsonResp({ error: makeErrorPayload('INVALID_MESSAGE', 'بيانات الإعادة غير مكتملة.') }, 400, request, env);
+      }
+
+      // Online replays are strictly server-authoritative (saved only by RaftRoom DO)
+      if (candidate.mode === 'online' || rawMatchId.toLowerCase().startsWith('online:')) {
+        return jsonResp(
+          { error: makeErrorPayload('UNAUTHORIZED', 'إعادات الجولات الجماعية تُحفظ من الخادم فقط.') },
+          403,
+          request,
+          env,
+        );
+      }
+
+      const deepCheck = validateReplayPayload(candidate as Record<string, unknown>);
+      if (!deepCheck.ok) {
+        return jsonResp({ error: makeErrorPayload('INVALID_MESSAGE', deepCheck.reasonAr) }, 400, request, env);
       }
 
       const verifyRes = verifyMatchResult({
@@ -671,10 +747,14 @@ async function handleWorkerRouteInner(request: Request, env: Env): Promise<Respo
         );
       }
 
+      const boundMatchId = rawMatchId.startsWith(`solo:${account.accountId}:`)
+        ? rawMatchId.slice(0, 128)
+        : `solo:${account.accountId}:${rawMatchId}`.slice(0, 128);
+
       const sanitized: RoundReplayRecord = {
-        matchId: candidate.matchId.trim().slice(0, 128),
-        roomCode: typeof candidate.roomCode === 'string' ? candidate.roomCode.slice(0, 16) : null,
-        mode: candidate.mode === 'online' ? 'online' : 'solo',
+        matchId: boundMatchId,
+        roomCode: null,
+        mode: 'solo',
         courseId: candidate.courseId,
         gameMode: candidate.gameMode,
         difficulty: candidate.difficulty,
@@ -687,10 +767,18 @@ async function handleWorkerRouteInner(request: Request, env: Env): Promise<Respo
         minRaftHp: Math.max(0, Math.min(100, Math.round(candidate.minRaftHp ?? 100))),
         createdAt: typeof candidate.createdAt === 'number' && Number.isFinite(candidate.createdAt) ? candidate.createdAt : Date.now(),
         players: Array.isArray(candidate.players) ? candidate.players.slice(0, 4) : [],
-        frames: candidate.frames.slice(0, 480),
+        frames: (candidate.frames ?? []).slice(0, 480),
         events: Array.isArray(candidate.events) ? candidate.events.slice(0, 160) : [],
       };
-      await saveRoundReplayInD1(env.DB, sanitized);
+      const saveResult = await saveRoundReplayInD1(env.DB, sanitized);
+      if (!saveResult.inserted) {
+        return jsonResp(
+          { error: makeErrorPayload('ROOM_ALREADY_EXISTS', 'هذه الإعادة محفوظة مسبقاً ولا يمكن استبدالها.') },
+          409,
+          request,
+          env,
+        );
+      }
       const response: SaveReplayHttpResponse = {
         ok: true,
         matchId: sanitized.matchId,
@@ -739,7 +827,7 @@ async function handleWorkerRouteInner(request: Request, env: Env): Promise<Respo
     // ==========================================
 
     if (path === '/api/v1/ops/status' && request.method === 'GET') {
-      if (!isOpsAuthorized(request, url, env)) {
+      if (!isOpsAuthorized(request, env)) {
         return jsonResp({ error: makeErrorPayload('UNAUTHORIZED', 'مفتاح مراقبة الخادم غير صالح.') }, 401, request, env);
       }
       const d1VerifiedCount = await getVerifiedMatchCountFromD1(env.DB);
@@ -752,10 +840,17 @@ async function handleWorkerRouteInner(request: Request, env: Env): Promise<Respo
     }
 
     if (path === '/api/v1/ops/analytics' && request.method === 'GET') {
-      if (!isOpsAuthorized(request, url, env)) {
+      if (!isOpsAuthorized(request, env)) {
         return jsonResp({ error: makeErrorPayload('UNAUTHORIZED', 'مفتاح مراقبة الخادم غير صالح.') }, 401, request, env);
       }
-      const analytics: OpsAnalyticsHttpResponse = await getBalanceAnalyticsFromD1(env.DB);
+      const rawCourseId = url.searchParams.get('courseId');
+      const rawGameMode = url.searchParams.get('gameMode');
+      const courseId = rawCourseId && isValidCourseId(rawCourseId) ? rawCourseId : undefined;
+      const gameMode = rawGameMode && isValidGameMode(rawGameMode) ? rawGameMode : undefined;
+      const analytics: OpsAnalyticsHttpResponse = await getBalanceAnalyticsFromD1(env.DB, {
+        courseId,
+        gameMode,
+      });
       return jsonResp(analytics, 200, request, env);
     }
 

@@ -212,6 +212,17 @@ export async function updateMyProfile(req: UpdateProfileHttpRequest): Promise<Pr
   });
 }
 
+export async function startSoloRun(params: {
+  courseId: CourseId;
+  gameMode: GameMode;
+  difficulty: 'easy' | 'normal' | 'hard';
+}): Promise<{ soloRunToken: string; issuedAt: number }> {
+  return apiRequest<{ soloRunToken: string; issuedAt: number }>('/api/v1/progression/start-solo-run', {
+    method: 'POST',
+    body: JSON.stringify(params),
+  });
+}
+
 export async function recordAccountMatch(match: MatchSummaryInput): Promise<RecordMatchHttpResponse> {
   return apiRequest<RecordMatchHttpResponse>('/api/v1/progression/record-match', {
     method: 'POST',
