@@ -21,5 +21,12 @@
       "tag": "v1",
       "new_sqlite_classes": ["RaftRoom"]
     }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "letsfart-db",
+      "database_id": "local-dev-db"
+    }
   ]
 }

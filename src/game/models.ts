@@ -4,17 +4,27 @@ import {
   PLAYER_ZONES,
   RAFT_LENGTH,
   RAFT_WIDTH,
-  getChannelBoundsAtZ,
 } from '../shared/course.ts';
-import type { CourseDefinition, PlayerCosmetic, PlayerSimState } from '../shared/types.ts';
+import { COSMETIC_COLOR_DEFS, RAFT_SKIN_PALETTES } from '../shared/cosmetics.ts';
+import { getEmoteDefinition } from '../shared/social.ts';
+import type {
+  CourseDefinition,
+  EmoteId,
+  PickupKind,
+  PlayerCosmetic,
+  PlayerSimState,
+  RaftSkinId,
+} from '../shared/types.ts';
 import type { ProceduralTextures } from './textures.ts';
+import { buildCourseWorld, type CourseSceneHandles } from './worldBuilder.ts';
 
-export const COSMETIC_COLORS = [
-  { body: 0xff595e, shorts: 0x1d3557, cheek: 0xff8fa3 }, // 0: Coral Red
-  { body: 0x1982c4, shorts: 0xffca3a, cheek: 0x64dfdf }, // 1: Teal Blue
-  { body: 0xffca3a, shorts: 0x6a4c93, cheek: 0xff9f1c }, // 2: Sunny Amber
-  { body: 0x9b5de5, shorts: 0x00bbf9, cheek: 0xf15bb5 }, // 3: Berry Violet
-];
+export type { CourseSceneHandles };
+
+export const COSMETIC_COLORS = COSMETIC_COLOR_DEFS.map((c) => ({
+  body: c.bodyNum,
+  shorts: c.shortsNum,
+  cheek: c.cheekNum,
+}));
 
 export interface CharacterRig {
   root: THREE.Group;
@@ -38,27 +48,40 @@ export interface CharacterRig {
   hatAnchor: THREE.Group;
   propellerBlade: THREE.Group | null;
   glassesAnchor: THREE.Group;
+  outfitAnchor: THREE.Group;
   contactShadow: THREE.Mesh;
   bodyMat: THREE.MeshStandardMaterial;
   shortsMat: THREE.MeshStandardMaterial;
   currentCosmeticKey: string;
+  emoteBadgeMesh: THREE.Mesh;
+  emoteBadgeMat: THREE.MeshBasicMaterial;
+  emoteBadgeCanvas: HTMLCanvasElement | null;
+  emoteBadgeCtx: CanvasRenderingContext2D | null;
+  emoteBadgeTex: THREE.CanvasTexture | null;
+  lastEmoteBadgeKey: string;
+  headBaseY: number;
 }
 
-export interface CourseSceneHandles {
-  waterMat: THREE.MeshStandardMaterial;
-  waterUniforms: { uTime: { value: number } };
-  movingGateMeshes: Map<string, THREE.Group>;
-  bumperMeshes: THREE.Group[];
-  checkpointFlags: Map<number, THREE.Mesh>;
-  checkpointRings: Map<number, THREE.Mesh>;
-  boostMeshes: THREE.Mesh[];
-  dispose: () => void;
-}
-
-export function createRaftModel(textures: ProceduralTextures): {
+export interface RaftModelHandles {
   raftGroup: THREE.Group;
   flagMesh: THREE.Mesh;
-} {
+  deckPlanks: THREE.Mesh[];
+  deckMat: THREE.MeshStandardMaterial;
+  logMat: THREE.MeshStandardMaterial;
+  dividerMat: THREE.MeshStandardMaterial;
+  flagMat: THREE.MeshStandardMaterial;
+  lanternMat: THREE.MeshStandardMaterial;
+  foamMat: THREE.MeshBasicMaterial;
+  baseDeckColor: THREE.Color;
+  currentRaftSkin: RaftSkinId;
+  shieldDome: THREE.Mesh;
+  magnetRing: THREE.Mesh;
+  anchorWinchGroup: THREE.Group;
+  anchorChain: THREE.Mesh;
+  anchorIronGroup: THREE.Group;
+}
+
+export function createRaftModel(textures: ProceduralTextures): RaftModelHandles {
   const raftGroup = new THREE.Group();
 
   const logMat = new THREE.MeshStandardMaterial({
@@ -108,7 +131,8 @@ export function createRaftModel(textures: ProceduralTextures): {
     raftGroup.add(logMesh);
   }
 
-  // 2. Four cross-plank deck beams (slight Y offset >= 0.02 so no Z-fighting)
+  // 2. Four cross-plank deck beams (tracked for hull damage visuals)
+  const deckPlanks: THREE.Mesh[] = [];
   const plankGeo = new THREE.BoxGeometry(RAFT_WIDTH + 0.1, 0.18, 1.25);
   const plankZs = [-2.15, -0.72, 0.72, 2.15];
   for (const pz of plankZs) {
@@ -117,9 +141,10 @@ export function createRaftModel(textures: ProceduralTextures): {
     plank.castShadow = true;
     plank.receiveShadow = true;
     raftGroup.add(plank);
+    deckPlanks.push(plank);
   }
 
-  // 3. Subtle quarter-zone inlay strips (clean wooden dividers without ugly lines)
+  // 3. Subtle quarter-zone inlay strips
   const dividerMat = new THREE.MeshStandardMaterial({
     color: 0x7f4f24,
     roughness: 0.85,
@@ -158,14 +183,15 @@ export function createRaftModel(textures: ProceduralTextures): {
   lanternCap.position.set(0, 2.55, -RAFT_LENGTH * 0.43);
   raftGroup.add(lanternCap);
 
+  const lanternMat = new THREE.MeshStandardMaterial({
+    color: 0xffe066,
+    emissive: 0xffaa00,
+    emissiveIntensity: 1.4,
+    roughness: 0.2,
+  });
   const lanternBulb = new THREE.Mesh(
     new THREE.SphereGeometry(0.16, 10, 8),
-    new THREE.MeshStandardMaterial({
-      color: 0xffe066,
-      emissive: 0xffaa00,
-      emissiveIntensity: 1.4,
-      roughness: 0.2,
-    }),
+    lanternMat,
   );
   lanternBulb.position.set(0, 2.35, -RAFT_LENGTH * 0.43);
   raftGroup.add(lanternBulb);
@@ -176,34 +202,517 @@ export function createRaftModel(textures: ProceduralTextures): {
   flagShape.lineTo(0, 0.48);
   flagShape.closePath();
   const flagGeo = new THREE.ExtrudeGeometry(flagShape, { depth: 0.04, bevelEnabled: false });
-  const flagMesh = new THREE.Mesh(
-    flagGeo,
-    new THREE.MeshStandardMaterial({ color: 0xff595e, roughness: 0.6 }),
-  );
+  const flagMat = new THREE.MeshStandardMaterial({ color: 0xff595e, roughness: 0.6 });
+  const flagMesh = new THREE.Mesh(flagGeo, flagMat);
   flagMesh.position.set(0.06, 2.42, -RAFT_LENGTH * 0.46);
   flagMesh.rotation.y = -Math.PI * 0.5;
   raftGroup.add(flagMesh);
 
   // 6. Soft water foam wake ring underneath the raft
+  const foamMat = new THREE.MeshBasicMaterial({
+    color: 0xe0fbfc,
+    transparent: true,
+    opacity: 0.42,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+  });
   const foamRing = new THREE.Mesh(
     new THREE.RingGeometry(2.7, 3.25, 28),
-    new THREE.MeshBasicMaterial({
-      color: 0xe0fbfc,
-      transparent: true,
-      opacity: 0.42,
-      side: THREE.DoubleSide,
-      depthWrite: false,
-    }),
+    foamMat,
   );
   foamRing.rotation.x = -Math.PI / 2;
   foamRing.position.y = 0.03;
   raftGroup.add(foamRing);
 
-  return { raftGroup, flagMesh };
+  // 7. Realistic Cast-Iron Bow Anchor Winch + Chain + Ship Anchor (GAME-03)
+  const ironMat = new THREE.MeshStandardMaterial({
+    color: 0x26323f,
+    metalness: 0.84,
+    roughness: 0.34,
+  });
+  const chainMat = new THREE.MeshStandardMaterial({
+    color: 0x64748b,
+    metalness: 0.88,
+    roughness: 0.28,
+  });
+
+  const anchorWinchGroup = new THREE.Group();
+  anchorWinchGroup.position.set(-RAFT_WIDTH * 0.45, 0.72, -RAFT_LENGTH * 0.34);
+
+  const winchDrum = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.18, 0.48, 12), ironMat);
+  winchDrum.rotation.z = Math.PI / 2;
+  const winchBracket = new THREE.Mesh(new THREE.BoxGeometry(0.62, 0.24, 0.24), dividerMat);
+  winchBracket.position.y = -0.1;
+  const winchCrank = new THREE.Mesh(new THREE.TorusGeometry(0.2, 0.04, 8, 14), brassMat);
+  winchCrank.rotation.y = Math.PI / 2;
+  winchCrank.position.x = 0.32;
+  anchorWinchGroup.add(winchDrum, winchBracket, winchCrank);
+
+  const anchorChain = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 1, 8), chainMat);
+  anchorChain.position.set(-0.38, -0.5, 0);
+  anchorWinchGroup.add(anchorChain);
+
+  const anchorIronGroup = new THREE.Group();
+  anchorIronGroup.position.set(-0.38, -0.35, 0);
+  const shank = new THREE.Mesh(new THREE.CylinderGeometry(0.055, 0.07, 0.9, 10), ironMat);
+  const crownRing = new THREE.Mesh(new THREE.TorusGeometry(0.12, 0.035, 8, 14), brassMat);
+  crownRing.position.y = 0.48;
+  const stockBar = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.045, 0.62, 8), ironMat);
+  stockBar.rotation.z = Math.PI / 2;
+  stockBar.position.y = 0.28;
+  const flukeCurve = new THREE.Mesh(
+    new THREE.TorusGeometry(0.32, 0.06, 8, 16, Math.PI * 0.95),
+    ironMat,
+  );
+  flukeCurve.rotation.z = Math.PI * 1.025;
+  flukeCurve.position.y = -0.22;
+  const leftTip = new THREE.Mesh(new THREE.ConeGeometry(0.11, 0.24, 4), ironMat);
+  leftTip.position.set(-0.34, -0.05, 0);
+  leftTip.rotation.z = -0.45;
+  const rightTip = new THREE.Mesh(new THREE.ConeGeometry(0.11, 0.24, 4), ironMat);
+  rightTip.position.set(0.34, -0.05, 0);
+  rightTip.rotation.z = 0.45;
+  anchorIronGroup.add(shank, crownRing, stockBar, flukeCurve, leftTip, rightTip);
+  anchorWinchGroup.add(anchorIronGroup);
+  raftGroup.add(anchorWinchGroup);
+
+  // 8. Protective Energy Shield Hex Dome (GAME-02)
+  const shieldDome = new THREE.Mesh(
+    new THREE.SphereGeometry(3.85, 24, 18),
+    new THREE.MeshBasicMaterial({
+      color: 0x38bdf8,
+      map: textures.shieldHexMap,
+      transparent: true,
+      opacity: 0.36,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    }),
+  );
+  shieldDome.scale.set(1.0, 0.72, 1.05);
+  shieldDome.position.y = 1.0;
+  shieldDome.visible = false;
+  raftGroup.add(shieldDome);
+
+  // 9. Magnet Aura Pulse Ring (GAME-01)
+  const magnetRing = new THREE.Mesh(
+    new THREE.TorusGeometry(3.6, 0.1, 10, 32),
+    new THREE.MeshBasicMaterial({
+      color: 0xf43f5e,
+      transparent: true,
+      opacity: 0.65,
+    }),
+  );
+  magnetRing.rotation.x = Math.PI / 2;
+  magnetRing.position.y = 0.32;
+  magnetRing.visible = false;
+  raftGroup.add(magnetRing);
+
+  return {
+    raftGroup,
+    flagMesh,
+    deckPlanks,
+    deckMat,
+    logMat,
+    dividerMat,
+    flagMat,
+    lanternMat,
+    foamMat,
+    baseDeckColor: new THREE.Color(RAFT_SKIN_PALETTES.classic_oak.deckHex),
+    currentRaftSkin: 'classic_oak',
+    shieldDome,
+    magnetRing,
+    anchorWinchGroup,
+    anchorChain,
+    anchorIronGroup,
+  };
+}
+
+export function applyRaftSkin(handles: RaftModelHandles, skinId: RaftSkinId | undefined): void {
+  const target: RaftSkinId = skinId && skinId in RAFT_SKIN_PALETTES ? skinId : 'classic_oak';
+  if (handles.currentRaftSkin === target) return;
+  handles.currentRaftSkin = target;
+  const pal = RAFT_SKIN_PALETTES[target];
+  handles.logMat.color.setHex(pal.logHex);
+  handles.baseDeckColor.setHex(pal.deckHex);
+  handles.deckMat.color.setHex(pal.deckHex);
+  handles.dividerMat.color.setHex(pal.dividerHex);
+  handles.flagMat.color.setHex(pal.flagHex);
+  handles.lanternMat.color.setHex(pal.lanternHex);
+  handles.lanternMat.emissive.setHex(pal.lanternHex);
+  handles.foamMat.color.setHex(pal.foamHex);
+}
+
+/**
+ * Ultra-detailed, multi-part realistic 3D pickup models (GAME-01).
+ * Cans look like authentic ribbed metallic tin cans with rolled rims, recessed lids, pull-tabs,
+ * and crisp Arabic wrap labels; tools look like realistic workshop/maritime hardware.
+ */
+export function createPickupModel(kind: PickupKind, textures: ProceduralTextures): THREE.Group {
+  const root = new THREE.Group();
+
+  // Shared floating water halo & sparkle aura underneath so pickups read cleanly at speed
+  const haloColorMap: Record<PickupKind, number> = {
+    lentil_can: 0xf59e0b,
+    fava_can: 0x10b981,
+    bean_can: 0xef4444,
+    shield: 0x38bdf8,
+    magnet: 0xf43f5e,
+    shockwave: 0xfacc15,
+    repair_kit: 0x22c55e,
+    mystery_crate: 0xc084fc,
+  };
+  const halo = new THREE.Mesh(
+    new THREE.RingGeometry(0.95, 1.28, 24),
+    new THREE.MeshBasicMaterial({
+      color: haloColorMap[kind],
+      transparent: true,
+      opacity: 0.65,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    }),
+  );
+  halo.rotation.x = -Math.PI / 2;
+  halo.position.y = 0.08;
+  root.add(halo);
+
+  const chromeMat = new THREE.MeshStandardMaterial({
+    color: 0xe2e8f0,
+    metalness: 0.92,
+    roughness: 0.16,
+  });
+  const darkMetalMat = new THREE.MeshStandardMaterial({
+    color: 0x334155,
+    metalness: 0.85,
+    roughness: 0.28,
+  });
+
+  if (kind === 'lentil_can' || kind === 'fava_can' || kind === 'bean_can') {
+    // Realistic Tilted Tin Can with Double-Seam Rims, Embossed Ribs, Recessed Lid & Pull-Tab!
+    const canGroup = new THREE.Group();
+    canGroup.position.y = 1.15;
+    canGroup.rotation.z = 0.16;
+
+    const r = 0.56;
+    const h = 1.24;
+
+    // Tin body with high-res wrap-around Arabic label texture
+    const bodyMat = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      map: textures.canLabels[kind],
+      roughness: 0.28,
+      metalness: 0.25,
+    });
+    const body = new THREE.Mesh(new THREE.CylinderGeometry(r, r, h, 28, 1, true), bodyMat);
+    body.castShadow = true;
+    canGroup.add(body);
+
+    // Rolled metallic top & bottom double-seam rims
+    const rimGeo = new THREE.TorusGeometry(r, 0.042, 10, 28);
+    const topRim = new THREE.Mesh(rimGeo, chromeMat);
+    topRim.rotation.x = Math.PI / 2;
+    topRim.position.y = h * 0.5;
+    const botRim = new THREE.Mesh(rimGeo, chromeMat);
+    botRim.rotation.x = Math.PI / 2;
+    botRim.position.y = -h * 0.5;
+    canGroup.add(topRim, botRim);
+
+    // Recessed stamped metallic lid + concentric ring + bottom plate
+    const lidPlate = new THREE.Mesh(new THREE.CylinderGeometry(r - 0.02, r - 0.02, 0.04, 24), chromeMat);
+    lidPlate.position.y = h * 0.5 - 0.025;
+    const lidGroove = new THREE.Mesh(new THREE.TorusGeometry(r * 0.68, 0.018, 8, 24), darkMetalMat);
+    lidGroove.rotation.x = Math.PI / 2;
+    lidGroove.position.y = h * 0.5 + 0.005;
+    const bottomPlate = new THREE.Mesh(new THREE.CylinderGeometry(r - 0.02, r - 0.02, 0.04, 24), chromeMat);
+    bottomPlate.position.y = -h * 0.5 + 0.02;
+    canGroup.add(lidPlate, lidGroove, bottomPlate);
+
+    // Authentic silver pull-tab opener on lid!
+    const pullRing = new THREE.Mesh(new THREE.TorusGeometry(0.11, 0.02, 8, 14), chromeMat);
+    pullRing.rotation.x = Math.PI / 2;
+    pullRing.position.set(0.12, h * 0.5 + 0.03, 0);
+    const pullRivet = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.035, 0.04, 8), darkMetalMat);
+    pullRivet.position.set(-0.04, h * 0.5 + 0.02, 0);
+    const pullLever = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.025, 0.1), chromeMat);
+    pullLever.position.set(0.04, h * 0.5 + 0.025, 0);
+    canGroup.add(pullRing, pullRivet, pullLever);
+
+    // Subtle embossed metallic rib bands near top & bottom
+    for (const ry of [h * 0.36, -h * 0.36]) {
+      const rib = new THREE.Mesh(new THREE.TorusGeometry(r + 0.008, 0.014, 6, 28), chromeMat);
+      rib.rotation.x = Math.PI / 2;
+      rib.position.y = ry;
+      canGroup.add(rib);
+    }
+
+    root.add(canGroup);
+    return root;
+  }
+
+  if (kind === 'shield') {
+    // Realistic Maritime Hexagonal Forcefield Emitter & Energy Shield Crest
+    const grp = new THREE.Group();
+    grp.position.y = 1.15;
+
+    const basePlate = new THREE.Mesh(new THREE.CylinderGeometry(0.58, 0.66, 0.2, 8), darkMetalMat);
+    basePlate.position.y = -0.35;
+    const brassCollar = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.46, 0.52, 0.16, 8),
+      new THREE.MeshStandardMaterial({ color: 0xf59e0b, metalness: 0.85, roughness: 0.25 }),
+    );
+    brassCollar.position.y = -0.2;
+
+    const coreCrystal = new THREE.Mesh(
+      new THREE.OctahedronGeometry(0.32, 0),
+      new THREE.MeshStandardMaterial({
+        color: 0x7dd3fc,
+        emissive: 0x0284c7,
+        emissiveIntensity: 1.3,
+        roughness: 0.12,
+        metalness: 0.2,
+      }),
+    );
+    coreCrystal.position.y = 0.2;
+
+    const crestShape = new THREE.Shape();
+    crestShape.moveTo(0, -0.55);
+    crestShape.lineTo(0.48, -0.18);
+    crestShape.lineTo(0.42, 0.45);
+    crestShape.lineTo(0, 0.58);
+    crestShape.lineTo(-0.42, 0.45);
+    crestShape.lineTo(-0.48, -0.18);
+    crestShape.closePath();
+
+    const shieldCrest = new THREE.Mesh(
+      new THREE.ExtrudeGeometry(crestShape, {
+        depth: 0.09,
+        bevelEnabled: true,
+        bevelThickness: 0.03,
+        bevelSize: 0.03,
+        bevelSegments: 2,
+      }),
+      new THREE.MeshStandardMaterial({
+        color: 0x38bdf8,
+        emissive: 0x0ea5e9,
+        emissiveIntensity: 0.55,
+        transparent: true,
+        opacity: 0.78,
+        roughness: 0.15,
+        metalness: 0.35,
+      }),
+    );
+    shieldCrest.position.set(0, 0.26, -0.045);
+
+    const frameRing = new THREE.Mesh(new THREE.TorusGeometry(0.68, 0.045, 8, 24), chromeMat);
+    frameRing.position.y = 0.22;
+
+    grp.add(basePlate, brassCollar, coreCrystal, shieldCrest, frameRing);
+    root.add(grp);
+    return root;
+  }
+
+  if (kind === 'magnet') {
+    // Realistic U-Shaped Red Horseshoe Magnet with Brushed Chrome Pole Caps & Copper Coils
+    const grp = new THREE.Group();
+    grp.position.y = 1.18;
+    grp.rotation.z = 0.2;
+
+    const curve = new THREE.CatmullRomCurve3([
+      new THREE.Vector3(-0.42, 0.36, 0),
+      new THREE.Vector3(-0.42, -0.18, 0),
+      new THREE.Vector3(-0.26, -0.48, 0),
+      new THREE.Vector3(0, -0.58, 0),
+      new THREE.Vector3(0.26, -0.48, 0),
+      new THREE.Vector3(0.42, -0.18, 0),
+      new THREE.Vector3(0.42, 0.36, 0),
+    ]);
+    const body = new THREE.Mesh(
+      new THREE.TubeGeometry(curve, 24, 0.17, 12, false),
+      new THREE.MeshStandardMaterial({ color: 0xdc2626, roughness: 0.32, metalness: 0.45 }),
+    );
+    body.castShadow = true;
+
+    const tipGeo = new THREE.CylinderGeometry(0.185, 0.185, 0.26, 14);
+    const leftTip = new THREE.Mesh(tipGeo, chromeMat);
+    leftTip.position.set(-0.42, 0.48, 0);
+    const rightTip = new THREE.Mesh(tipGeo, chromeMat);
+    rightTip.position.set(0.42, 0.48, 0);
+
+    const coilMat = new THREE.MeshStandardMaterial({ color: 0xd97706, metalness: 0.85, roughness: 0.25 });
+    const coilGeo = new THREE.CylinderGeometry(0.195, 0.195, 0.08, 14);
+    const leftCoil = new THREE.Mesh(coilGeo, coilMat);
+    leftCoil.position.set(-0.42, 0.28, 0);
+    const rightCoil = new THREE.Mesh(coilGeo, coilMat);
+    rightCoil.position.set(0.42, 0.28, 0);
+
+    const sparkArc = new THREE.Mesh(
+      new THREE.TorusGeometry(0.32, 0.025, 6, 16, Math.PI),
+      new THREE.MeshBasicMaterial({ color: 0x7dd3fc }),
+    );
+    sparkArc.position.set(0, 0.56, 0);
+
+    grp.add(body, leftTip, rightTip, leftCoil, rightCoil, sparkArc);
+    root.add(grp);
+    return root;
+  }
+
+  if (kind === 'shockwave') {
+    // Naval Sonic Pressure Sphere with Brass Collar & Radial Acoustic Horns
+    const grp = new THREE.Group();
+    grp.position.y = 1.15;
+
+    const core = new THREE.Mesh(
+      new THREE.SphereGeometry(0.46, 18, 14),
+      new THREE.MeshStandardMaterial({
+        color: 0x1e293b,
+        metalness: 0.85,
+        roughness: 0.24,
+      }),
+    );
+    core.castShadow = true;
+    grp.add(core);
+
+    const hazardBand = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.48, 0.48, 0.22, 18),
+      new THREE.MeshStandardMaterial({ color: 0xffffff, map: textures.hazardStripeMap, roughness: 0.35 }),
+    );
+    grp.add(hazardBand);
+
+    const hornMat = new THREE.MeshStandardMaterial({ color: 0xfacc15, metalness: 0.82, roughness: 0.22 });
+    for (let i = 0; i < 4; i++) {
+      const a = (i * Math.PI) / 2;
+      const horn = new THREE.Mesh(new THREE.ConeGeometry(0.19, 0.38, 12), hornMat);
+      horn.position.set(Math.cos(a) * 0.54, 0, Math.sin(a) * 0.54);
+      horn.rotation.z = -Math.cos(a) * (Math.PI / 2);
+      horn.rotation.x = Math.sin(a) * (Math.PI / 2);
+      grp.add(horn);
+    }
+
+    const pulseRing = new THREE.Mesh(
+      new THREE.TorusGeometry(0.76, 0.035, 8, 24),
+      new THREE.MeshBasicMaterial({ color: 0xfef08a }),
+    );
+    pulseRing.rotation.x = Math.PI / 2;
+    grp.add(pulseRing);
+
+    root.add(grp);
+    return root;
+  }
+
+  if (kind === 'repair_kit') {
+    // Detailed Red Steel Mechanic's Toolbox + Chrome Open-End Wrench + Spare Timber Plank!
+    const grp = new THREE.Group();
+    grp.position.y = 1.05;
+    grp.rotation.y = 0.35;
+
+    const redSteelMat = new THREE.MeshStandardMaterial({
+      color: 0xb91c1c,
+      metalness: 0.55,
+      roughness: 0.32,
+    });
+    const whiteCrossMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.3 });
+    const emeraldCrossMat = new THREE.MeshStandardMaterial({
+      color: 0x16a34a,
+      emissive: 0x15803d,
+      emissiveIntensity: 0.4,
+      roughness: 0.3,
+    });
+
+    const boxBase = new THREE.Mesh(new THREE.BoxGeometry(1.06, 0.52, 0.64), redSteelMat);
+    boxBase.castShadow = true;
+    const boxLid = new THREE.Mesh(new THREE.BoxGeometry(1.1, 0.14, 0.68), redSteelMat);
+    boxLid.position.y = 0.32;
+
+    // Chrome clasp latches
+    const latchGeo = new THREE.BoxGeometry(0.11, 0.14, 0.05);
+    const latchL = new THREE.Mesh(latchGeo, chromeMat);
+    latchL.position.set(-0.3, 0.24, 0.35);
+    const latchR = new THREE.Mesh(latchGeo, chromeMat);
+    latchR.position.set(0.3, 0.24, 0.35);
+
+    // Top steel carry handle
+    const handleBar = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.035, 0.44, 8), chromeMat);
+    handleBar.rotation.z = Math.PI / 2;
+    handleBar.position.y = 0.52;
+    const handlePostL = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, 0.14, 8), darkMetalMat);
+    handlePostL.position.set(-0.2, 0.45, 0);
+    const handlePostR = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, 0.14, 8), darkMetalMat);
+    handlePostR.position.set(0.2, 0.45, 0);
+
+    // Front emblem badge + emerald repair cross
+    const badge = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.18, 0.04, 16), whiteCrossMat);
+    badge.rotation.x = Math.PI / 2;
+    badge.position.set(0, 0, 0.33);
+    const crossH = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.07, 0.05), emeraldCrossMat);
+    crossH.position.set(0, 0, 0.34);
+    const crossV = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.2, 0.05), emeraldCrossMat);
+    crossV.position.set(0, 0, 0.34);
+
+    // Gleaming Chrome Open-End Mechanic's Wrench resting diagonally atop the lid
+    const wrenchGroup = new THREE.Group();
+    wrenchGroup.position.set(0.04, 0.44, 0.16);
+    wrenchGroup.rotation.set(0.1, 0.35, -0.15);
+    const wrenchShaft = new THREE.Mesh(new THREE.BoxGeometry(0.76, 0.055, 0.11), chromeMat);
+    const headL = new THREE.Mesh(new THREE.TorusGeometry(0.12, 0.04, 8, 12, Math.PI * 1.45), chromeMat);
+    headL.rotation.x = Math.PI / 2;
+    headL.rotation.z = 0.7;
+    headL.position.x = -0.4;
+    const headR = new THREE.Mesh(new THREE.TorusGeometry(0.11, 0.038, 8, 12, Math.PI * 1.45), chromeMat);
+    headR.rotation.x = Math.PI / 2;
+    headR.rotation.z = -2.4;
+    headR.position.x = 0.4;
+    wrenchGroup.add(wrenchShaft, headL, headR);
+
+    // Spare wooden hull plank strapped under box
+    const sparePlank = new THREE.Mesh(
+      new THREE.BoxGeometry(1.16, 0.1, 0.42),
+      new THREE.MeshStandardMaterial({ color: 0xf0c99d, map: textures.woodMap, roughness: 0.75 }),
+    );
+    sparePlank.position.set(0, -0.32, 0);
+
+    grp.add(
+      boxBase,
+      boxLid,
+      latchL,
+      latchR,
+      handleBar,
+      handlePostL,
+      handlePostR,
+      badge,
+      crossH,
+      crossV,
+      wrenchGroup,
+      sparePlank,
+    );
+    root.add(grp);
+    return root;
+  }
+
+  // Mystery Crate ('mystery_crate'): Wooden supply crate with dark corner trim + iron studs
+  const crateGroup = new THREE.Group();
+  crateGroup.position.y = 1.12;
+  const crateBox = new THREE.Mesh(
+    new THREE.BoxGeometry(0.98, 0.98, 0.98),
+    new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      map: textures.crateMap,
+      roughness: 0.65,
+      metalness: 0.1,
+    }),
+  );
+  crateBox.castShadow = true;
+  const crateFrame = new THREE.Mesh(
+    new THREE.BoxGeometry(1.04, 1.04, 1.04),
+    new THREE.MeshStandardMaterial({ color: 0x7c2d12, wireframe: true }),
+  );
+  crateGroup.add(crateBox, crateFrame);
+  root.add(crateGroup);
+  return root;
 }
 
 function buildCosmeticsForRig(rig: CharacterRig, cosmetic: PlayerCosmetic): void {
-  const key = `${cosmetic.hat}:${cosmetic.glasses}:${cosmetic.colorIndex}`;
+  const outfit = cosmetic.outfit ?? 'classic';
+  const key = `${cosmetic.hat}:${cosmetic.glasses}:${cosmetic.colorIndex}:${outfit}`;
   if (rig.currentCosmeticKey === key) return;
   rig.currentCosmeticKey = key;
 
@@ -211,12 +720,15 @@ function buildCosmeticsForRig(rig: CharacterRig, cosmetic: PlayerCosmetic): void
   rig.bodyMat.color.setHex(palette.body);
   rig.shortsMat.color.setHex(palette.shorts);
 
-  // Clear old hats & glasses cleanly
+  // Clear old hats, glasses & outfit accessories cleanly
   while (rig.hatAnchor.children.length > 0) {
     rig.hatAnchor.remove(rig.hatAnchor.children[0]);
   }
   while (rig.glassesAnchor.children.length > 0) {
     rig.glassesAnchor.remove(rig.glassesAnchor.children[0]);
+  }
+  while (rig.outfitAnchor.children.length > 0) {
+    rig.outfitAnchor.remove(rig.outfitAnchor.children[0]);
   }
   rig.propellerBlade = null;
 
@@ -272,6 +784,50 @@ function buildCosmeticsForRig(rig: CharacterRig, cosmetic: PlayerCosmetic): void
     bladeGroup.add(blade);
     rig.propellerBlade = bladeGroup;
     rig.hatAnchor.add(beanie, stem, bladeGroup);
+  } else if (cosmetic.hat === 'pirate') {
+    const feltMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.72 });
+    const trimMat = new THREE.MeshStandardMaterial({ color: 0xfbbf24, metalness: 0.75, roughness: 0.25 });
+    const brim = new THREE.Mesh(new THREE.CylinderGeometry(0.56, 0.56, 0.06, 3), feltMat);
+    brim.position.y = 0.04;
+    const dome = new THREE.Mesh(new THREE.SphereGeometry(0.34, 12, 8, 0, Math.PI * 2, 0, Math.PI * 0.55), feltMat);
+    dome.position.y = 0.04;
+    const emblem = new THREE.Mesh(new THREE.SphereGeometry(0.08, 8, 8), trimMat);
+    emblem.position.set(0, 0.18, -0.34);
+    rig.hatAnchor.add(brim, dome, emblem);
+  } else if (cosmetic.hat === 'viking') {
+    const steelMat = new THREE.MeshStandardMaterial({ color: 0x94a3b8, metalness: 0.78, roughness: 0.3 });
+    const hornMat = new THREE.MeshStandardMaterial({ color: 0xfef3c7, roughness: 0.4 });
+    const dome = new THREE.Mesh(new THREE.SphereGeometry(0.41, 14, 10, 0, Math.PI * 2, 0, Math.PI * 0.58), steelMat);
+    const leftHorn = new THREE.Mesh(new THREE.ConeGeometry(0.09, 0.36, 8), hornMat);
+    leftHorn.position.set(-0.42, 0.18, 0);
+    leftHorn.rotation.z = 0.75;
+    const rightHorn = new THREE.Mesh(new THREE.ConeGeometry(0.09, 0.36, 8), hornMat);
+    rightHorn.position.set(0.42, 0.18, 0);
+    rightHorn.rotation.z = -0.75;
+    rig.hatAnchor.add(dome, leftHorn, rightHorn);
+  } else if (cosmetic.hat === 'snorkel') {
+    const bandMat = new THREE.MeshStandardMaterial({ color: 0x06d6a0, roughness: 0.45 });
+    const tubeMat = new THREE.MeshStandardMaterial({ color: 0xfbbf24, roughness: 0.35 });
+    const headband = new THREE.Mesh(new THREE.CylinderGeometry(0.4, 0.4, 0.1, 14), bandMat);
+    headband.position.y = 0.05;
+    const tube = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 0.58, 10), tubeMat);
+    tube.position.set(0.42, 0.18, -0.05);
+    rig.hatAnchor.add(headband, tube);
+  } else if (cosmetic.hat === 'storm_hood') {
+    const hoodMat = new THREE.MeshStandardMaterial({
+      color: 0x1d4ed8,
+      emissive: 0x0ea5e9,
+      emissiveIntensity: 0.25,
+      roughness: 0.5,
+    });
+    const hood = new THREE.Mesh(new THREE.ConeGeometry(0.46, 0.44, 14), hoodMat);
+    hood.position.y = 0.18;
+    const lightningGem = new THREE.Mesh(
+      new THREE.OctahedronGeometry(0.09, 0),
+      new THREE.MeshStandardMaterial({ color: 0x7dd3fc, emissive: 0x38bdf8, emissiveIntensity: 0.9 }),
+    );
+    lightningGem.position.set(0, 0.12, -0.36);
+    rig.hatAnchor.add(hood, lightningGem);
   }
 
   // Build Glasses (mounted on face front -Z)
@@ -295,6 +851,85 @@ function buildCosmeticsForRig(rig: CharacterRig, cosmetic: PlayerCosmetic): void
     rightRim.position.set(0.17, 0, -0.02);
     const bridge = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.03, 0.03), rimMat);
     rig.glassesAnchor.add(leftRim, rightRim, bridge);
+  } else if (cosmetic.glasses === 'monocle') {
+    const goldMat = new THREE.MeshStandardMaterial({ color: 0xfbbf24, metalness: 0.85, roughness: 0.2 });
+    const glassMat = new THREE.MeshStandardMaterial({
+      color: 0xbae6fd,
+      transparent: true,
+      opacity: 0.55,
+      roughness: 0.1,
+    });
+    const rim = new THREE.Mesh(new THREE.TorusGeometry(0.15, 0.028, 8, 16), goldMat);
+    rim.position.set(0.17, 0, -0.02);
+    const pane = new THREE.Mesh(new THREE.CircleGeometry(0.13, 14), glassMat);
+    pane.position.set(0.17, 0, -0.02);
+    rig.glassesAnchor.add(rim, pane);
+  } else if (cosmetic.glasses === 'cyber_visor') {
+    const visorMat = new THREE.MeshStandardMaterial({
+      color: 0x38bdf8,
+      emissive: 0x0284c7,
+      emissiveIntensity: 0.75,
+      roughness: 0.12,
+      metalness: 0.65,
+    });
+    const visor = new THREE.Mesh(new THREE.BoxGeometry(0.62, 0.17, 0.08), visorMat);
+    visor.position.set(0, 0, -0.02);
+    rig.glassesAnchor.add(visor);
+  } else if (cosmetic.glasses === 'heart_shades') {
+    const pinkMat = new THREE.MeshStandardMaterial({ color: 0xf43f5e, roughness: 0.25, metalness: 0.3 });
+    const leftHeart = new THREE.Mesh(new THREE.SphereGeometry(0.13, 10, 8), pinkMat);
+    leftHeart.scale.set(1.1, 0.9, 0.45);
+    leftHeart.position.set(-0.17, 0, -0.02);
+    const rightHeart = new THREE.Mesh(new THREE.SphereGeometry(0.13, 10, 8), pinkMat);
+    rightHeart.scale.set(1.1, 0.9, 0.45);
+    rightHeart.position.set(0.17, 0, -0.02);
+    const bridge = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.04, 0.04), pinkMat);
+    rig.glassesAnchor.add(leftHeart, rightHeart, bridge);
+  }
+
+  // Build Outfit Accessories on Torso
+  if (outfit === 'captain_coat') {
+    const goldMat = new THREE.MeshStandardMaterial({ color: 0xffd13b, metalness: 0.8, roughness: 0.25 });
+    const leftEpaulet = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.08, 0.22), goldMat);
+    leftEpaulet.position.set(-0.48, 0.96, 0);
+    const rightEpaulet = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.08, 0.22), goldMat);
+    rightEpaulet.position.set(0.48, 0.96, 0);
+    const buckle = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.14, 0.08), goldMat);
+    buckle.position.set(0, 0.56, -0.52);
+    rig.outfitAnchor.add(leftEpaulet, rightEpaulet, buckle);
+  } else if (outfit === 'diver_suit') {
+    const tankMat = new THREE.MeshStandardMaterial({ color: 0x06d6a0, metalness: 0.5, roughness: 0.35 });
+    const strapMat = new THREE.MeshStandardMaterial({ color: 0x0f172a, roughness: 0.7 });
+    const tank = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.14, 0.48, 12), tankMat);
+    tank.position.set(0, 0.8, 0.48);
+    const harness = new THREE.Mesh(new THREE.TorusGeometry(0.49, 0.04, 8, 18), strapMat);
+    harness.rotation.x = Math.PI / 2;
+    harness.position.y = 0.72;
+    rig.outfitAnchor.add(tank, harness);
+  } else if (outfit === 'volcanic_armor') {
+    const obsidianMat = new THREE.MeshStandardMaterial({ color: 0x1f2937, metalness: 0.7, roughness: 0.35 });
+    const emberMat = new THREE.MeshStandardMaterial({
+      color: 0xf97316,
+      emissive: 0xea580c,
+      emissiveIntensity: 0.9,
+    });
+    const leftPauldron = new THREE.Mesh(new THREE.SphereGeometry(0.22, 10, 8), obsidianMat);
+    leftPauldron.position.set(-0.5, 0.95, 0);
+    const rightPauldron = new THREE.Mesh(new THREE.SphereGeometry(0.22, 10, 8), obsidianMat);
+    rightPauldron.position.set(0.5, 0.95, 0);
+    const core = new THREE.Mesh(new THREE.OctahedronGeometry(0.13, 0), emberMat);
+    core.position.set(0, 0.74, -0.52);
+    rig.outfitAnchor.add(leftPauldron, rightPauldron, core);
+  } else if (outfit === 'royal_robe') {
+    const robeMat = new THREE.MeshStandardMaterial({ color: 0x7e22ce, roughness: 0.65 });
+    const goldMat = new THREE.MeshStandardMaterial({ color: 0xfbbf24, metalness: 0.85, roughness: 0.2 });
+    const cape = new THREE.Mesh(new THREE.BoxGeometry(0.86, 0.7, 0.1), robeMat);
+    cape.position.set(0, 0.66, 0.46);
+    cape.rotation.x = 0.16;
+    const collar = new THREE.Mesh(new THREE.TorusGeometry(0.38, 0.06, 8, 16), goldMat);
+    collar.rotation.x = Math.PI / 2;
+    collar.position.y = 1.02;
+    rig.outfitAnchor.add(cape, collar);
   }
 }
 
@@ -483,6 +1118,33 @@ export function createCharacterRig(
   );
   bodyPivot.add(headGroup);
 
+  // 7. Floating CanvasTexture Emote Badge above head (zero per-frame allocations)
+  const emoteBadgeCanvas =
+    typeof document !== 'undefined' ? document.createElement('canvas') : null;
+  let emoteBadgeCtx: CanvasRenderingContext2D | null = null;
+  let emoteBadgeTex: THREE.CanvasTexture | null = null;
+  if (emoteBadgeCanvas) {
+    emoteBadgeCanvas.width = 192;
+    emoteBadgeCanvas.height = 192;
+    emoteBadgeCtx = emoteBadgeCanvas.getContext('2d');
+    emoteBadgeTex = new THREE.CanvasTexture(emoteBadgeCanvas);
+    emoteBadgeTex.colorSpace = THREE.SRGBColorSpace;
+  }
+  const emoteBadgeMat = new THREE.MeshBasicMaterial({
+    color: 0xffffff,
+    map: emoteBadgeTex,
+    transparent: true,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+  });
+  const emoteBadgeMesh = new THREE.Mesh(new THREE.PlaneGeometry(1.15, 1.15), emoteBadgeMat);
+  emoteBadgeMesh.position.set(0, proportions.headY + 1.08, 0);
+  emoteBadgeMesh.visible = false;
+  bodyPivot.add(emoteBadgeMesh);
+
+  const outfitAnchor = new THREE.Group();
+  bodyPivot.add(outfitAnchor);
+
   const rig: CharacterRig = {
     root,
     bodyPivot,
@@ -505,14 +1167,79 @@ export function createCharacterRig(
     hatAnchor,
     propellerBlade: null,
     glassesAnchor,
+    outfitAnchor,
     contactShadow,
     bodyMat,
     shortsMat,
     currentCosmeticKey: '',
+    emoteBadgeMesh,
+    emoteBadgeMat,
+    emoteBadgeCanvas,
+    emoteBadgeCtx,
+    emoteBadgeTex,
+    lastEmoteBadgeKey: '',
+    headBaseY: proportions.headY,
   };
 
   buildCosmeticsForRig(rig, cosmetic);
   return rig;
+}
+
+function updateEmoteBadge(rig: CharacterRig, emoteId: EmoteId): void {
+  if (rig.lastEmoteBadgeKey === emoteId) return;
+  rig.lastEmoteBadgeKey = emoteId;
+  const ctx = rig.emoteBadgeCtx;
+  const canvas = rig.emoteBadgeCanvas;
+  const tex = rig.emoteBadgeTex;
+  if (!ctx || !canvas || !tex) return;
+
+  const def = getEmoteDefinition(emoteId);
+  const w = canvas.width;
+  const h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+
+  // Comic speech bubble circle + pointer tail
+  ctx.fillStyle = '#fff8e7';
+  ctx.strokeStyle = '#14222f';
+  ctx.lineWidth = 8;
+
+  ctx.beginPath();
+  ctx.arc(w / 2, h / 2 - 12, 74, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+
+  // Golden inner halo
+  ctx.strokeStyle = '#ffd13b';
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.arc(w / 2, h / 2 - 12, 65, 0, Math.PI * 2);
+  ctx.stroke();
+
+  // Little downward speech pointer
+  ctx.fillStyle = '#fff8e7';
+  ctx.strokeStyle = '#14222f';
+  ctx.lineWidth = 6;
+  ctx.beginPath();
+  ctx.moveTo(w / 2 - 14, h / 2 + 54);
+  ctx.lineTo(w / 2, h / 2 + 78);
+  ctx.lineTo(w / 2 + 14, h / 2 + 54);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+
+  // Emoji icon
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = '68px sans-serif';
+  ctx.fillStyle = '#14222f';
+  ctx.fillText(def.icon, w / 2, h / 2 - 22);
+
+  // Arabic label pill inside bubble bottom
+  ctx.font = 'bold 24px Cairo, Tajawal, sans-serif';
+  ctx.fillStyle = '#0f2740';
+  ctx.fillText(def.labelAr, w / 2, h / 2 + 34);
+
+  tex.needsUpdate = true;
 }
 
 export function animateCharacterRig(
@@ -540,6 +1267,8 @@ export function animateCharacterRig(
 
   if (isFalling) {
     // Comical flailing fall pose
+    rig.emoteBadgeMesh.visible = false;
+    rig.bodyPivot.position.x = 0;
     rig.bodyPivot.rotation.set(Math.sin(simTime * 16) * 0.4, simTime * 6, Math.cos(simTime * 14) * 0.4);
     rig.leftArm.rotation.x = -2.4 + Math.sin(simTime * 22) * 0.6;
     rig.rightArm.rotation.x = -2.4 - Math.sin(simTime * 22) * 0.6;
@@ -562,6 +1291,7 @@ export function animateCharacterRig(
     1 - strainSquash + releaseStretch,
     1 + strainSquash * 0.8 - releaseStretch * 0.5,
   );
+  rig.bodyPivot.position.x = 0;
   rig.bodyPivot.position.y = idleBob + Math.abs(walkCycle) * 0.07;
 
   // Lean into lateral movement + forward strain pitch when farting
@@ -626,6 +1356,192 @@ export function animateCharacterRig(
   rig.leftCheekFlush.scale.set(flushScale * 1.1, flushScale * 0.75, 0.5);
   rig.rightCheekFlush.scale.set(flushScale * 1.1, flushScale * 0.75, 0.5);
   rig.mouth.scale.set(0.75 + power * 0.7, 0.65 + power * 1.1, 1);
+
+  // 3. Expressive 3D Character Emote Overlay (ONLINE-11)
+  const emote = player.activeEmote ?? null;
+  if (emote) {
+    updateEmoteBadge(rig, emote.id);
+    rig.emoteBadgeMesh.visible = true;
+    rig.emoteBadgeMesh.position.y = rig.headBaseY + 1.08 + Math.sin(simTime * 7.5) * 0.08;
+    const badgePop = 0.96 + Math.sin(simTime * 11) * 0.06;
+    rig.emoteBadgeMesh.scale.setScalar(badgePop);
+
+    if (emote.id === 'laugh') {
+      rig.bodyPivot.position.y += Math.abs(Math.sin(simTime * 15)) * 0.15;
+      rig.bodyPivot.rotation.x = -0.18 + Math.sin(simTime * 15) * 0.1;
+      rig.headGroup.rotation.x = 0.42 + Math.sin(simTime * 18) * 0.12;
+      rig.leftArm.rotation.z = 0.5 + Math.sin(simTime * 16) * 0.22;
+      rig.rightArm.rotation.z = -0.5 - Math.sin(simTime * 16) * 0.22;
+      rig.mouth.scale.set(1.45, 1.55, 1);
+    } else if (emote.id === 'fear') {
+      rig.bodyPivot.position.x = Math.sin(simTime * 55) * 0.055;
+      rig.bodyPivot.scale.set(1.06, 0.88, 1.06);
+      rig.leftArm.rotation.x = -2.2 + Math.sin(simTime * 30) * 0.15;
+      rig.rightArm.rotation.x = -2.2 - Math.sin(simTime * 30) * 0.15;
+      rig.leftEye.scale.setScalar(1.55);
+      rig.rightEye.scale.setScalar(1.55);
+      rig.leftPupil.scale.setScalar(0.55);
+      rig.rightPupil.scale.setScalar(0.55);
+      rig.mouth.scale.set(1.3, 1.85, 1);
+    } else if (emote.id === 'celebrate') {
+      rig.bodyPivot.position.y += Math.abs(Math.sin(simTime * 10)) * 0.26;
+      rig.leftArm.rotation.z = 2.45 + Math.sin(simTime * 14) * 0.28;
+      rig.rightArm.rotation.z = -2.45 - Math.sin(simTime * 14) * 0.28;
+      rig.headGroup.rotation.y = Math.sin(simTime * 8) * 0.4;
+      rig.mouth.scale.set(1.35, 1.35, 1);
+    } else if (emote.id === 'dance') {
+      rig.bodyPivot.rotation.z = Math.sin(simTime * 9) * 0.22;
+      rig.bodyPivot.position.y += Math.abs(Math.sin(simTime * 12)) * 0.14;
+      rig.leftArm.rotation.z = 1.55 + Math.sin(simTime * 10) * 0.75;
+      rig.rightArm.rotation.z = -1.55 + Math.sin(simTime * 10) * 0.75;
+      rig.buttGroup.rotation.z = Math.sin(simTime * 12) * 0.34;
+    } else if (emote.id === 'point_left') {
+      rig.headGroup.rotation.y = -1.25;
+      rig.leftArm.rotation.z = 1.45 + Math.sin(simTime * 14) * 0.12;
+      rig.leftArm.rotation.x = -0.3;
+      rig.rightArm.rotation.z = -0.15;
+    } else if (emote.id === 'point_right') {
+      rig.headGroup.rotation.y = 1.25;
+      rig.rightArm.rotation.z = -1.45 - Math.sin(simTime * 14) * 0.12;
+      rig.rightArm.rotation.x = -0.3;
+      rig.leftArm.rotation.z = 0.15;
+    }
+  } else {
+    rig.emoteBadgeMesh.visible = false;
+  }
+}
+
+export function createGhostRaftModel(): THREE.Group {
+  const ghostGroup = new THREE.Group();
+  const holoMat = new THREE.MeshBasicMaterial({
+    color: 0x38bdf8,
+    transparent: true,
+    opacity: 0.34,
+    wireframe: false,
+    depthWrite: false,
+  });
+  const wireMat = new THREE.MeshBasicMaterial({
+    color: 0xbae6fd,
+    transparent: true,
+    opacity: 0.65,
+    wireframe: true,
+    depthWrite: false,
+  });
+
+  const hullGeo = new THREE.BoxGeometry(RAFT_WIDTH, 0.72, RAFT_LENGTH);
+  const hull = new THREE.Mesh(hullGeo, holoMat);
+  hull.position.y = 0.38;
+  const hullWire = new THREE.Mesh(hullGeo, wireMat);
+  hullWire.position.y = 0.38;
+
+  const mast = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.14, 2.4, 8), wireMat);
+  mast.position.set(0, 1.8, -RAFT_LENGTH * 0.42);
+
+  const pennant = new THREE.Mesh(new THREE.ConeGeometry(0.45, 0.9, 4), holoMat);
+  pennant.rotation.z = Math.PI / 2;
+  pennant.position.set(0.45, 2.7, -RAFT_LENGTH * 0.42);
+
+  ghostGroup.add(hull, hullWire, mast, pennant);
+  return ghostGroup;
+}
+
+export function createTreasureModel(kind: 'coin' | 'chest'): THREE.Group {
+  const root = new THREE.Group();
+  const goldMat = new THREE.MeshStandardMaterial({
+    color: 0xfacc15,
+    emissive: 0xb45309,
+    emissiveIntensity: 0.38,
+    metalness: 0.88,
+    roughness: 0.18,
+  });
+
+  if (kind === 'coin') {
+    const halo = new THREE.Mesh(
+      new THREE.RingGeometry(0.65, 0.92, 20),
+      new THREE.MeshBasicMaterial({
+        color: 0xfde047,
+        transparent: true,
+        opacity: 0.55,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      }),
+    );
+    halo.rotation.x = -Math.PI / 2;
+    halo.position.y = 0.08;
+
+    const coinDisc = new THREE.Mesh(new THREE.CylinderGeometry(0.62, 0.62, 0.16, 20), goldMat);
+    coinDisc.rotation.x = Math.PI / 2;
+    coinDisc.position.y = 1.08;
+    coinDisc.castShadow = true;
+
+    const innerRim = new THREE.Mesh(
+      new THREE.TorusGeometry(0.45, 0.05, 8, 20),
+      new THREE.MeshStandardMaterial({ color: 0xfef08a, metalness: 0.9, roughness: 0.14 }),
+    );
+    innerRim.position.set(0, 1.08, 0.07);
+
+    const innerRimBack = innerRim.clone();
+    innerRimBack.position.z = -0.07;
+
+    root.add(halo, coinDisc, innerRim, innerRimBack);
+    return root;
+  }
+
+  // Jeweled Pirate Treasure Chest
+  const halo = new THREE.Mesh(
+    new THREE.RingGeometry(1.05, 1.42, 24),
+    new THREE.MeshBasicMaterial({
+      color: 0xf59e0b,
+      transparent: true,
+      opacity: 0.65,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    }),
+  );
+  halo.rotation.x = -Math.PI / 2;
+  halo.position.y = 0.08;
+
+  const woodMat = new THREE.MeshStandardMaterial({
+    color: 0x78350f,
+    roughness: 0.72,
+    metalness: 0.08,
+  });
+
+  const grp = new THREE.Group();
+  grp.position.y = 0.9;
+
+  const chestBody = new THREE.Mesh(new THREE.BoxGeometry(1.32, 0.74, 0.88), woodMat);
+  chestBody.castShadow = true;
+  const chestLid = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.44, 0.44, 1.32, 12, 1, false, 0, Math.PI),
+    woodMat,
+  );
+  chestLid.rotation.z = Math.PI / 2;
+  chestLid.position.y = 0.37;
+
+  const bandGeo = new THREE.BoxGeometry(0.14, 0.82, 0.94);
+  const bandL = new THREE.Mesh(bandGeo, goldMat);
+  bandL.position.x = -0.44;
+  const bandR = new THREE.Mesh(bandGeo, goldMat);
+  bandR.position.x = 0.44;
+
+  const lockPlate = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.28, 0.08), goldMat);
+  lockPlate.position.set(0, 0.28, 0.46);
+
+  const rubyGem = new THREE.Mesh(
+    new THREE.OctahedronGeometry(0.22, 0),
+    new THREE.MeshStandardMaterial({
+      color: 0xf43f5e,
+      emissive: 0xe11d48,
+      emissiveIntensity: 0.9,
+      roughness: 0.12,
+    }),
+  );
+  rubyGem.position.set(0, 0.75, 0);
+
+  grp.add(chestBody, chestLid, bandL, bandR, lockPlate, rubyGem);
+  root.add(halo, grp);
+  return root;
 }
 
 export function createCourseScene(
@@ -633,428 +1549,5 @@ export function createCourseScene(
   textures: ProceduralTextures,
   course: CourseDefinition = COURSE_MAIN,
 ): CourseSceneHandles {
-  const disposables: { dispose: () => void }[] = [];
-
-  // 1. Dynamic Sunlit Tropical Ocean Water with custom wave & foam shader extension
-  const waterUniforms = { uTime: { value: 0 } };
-  const waterGeo = new THREE.PlaneGeometry(340, 460, 64, 96);
-  waterGeo.rotateX(-Math.PI / 2);
-  const waterMat = new THREE.MeshStandardMaterial({
-    color: 0x1694c8,
-    roughness: 0.22,
-    metalness: 0.15,
-  });
-  waterMat.onBeforeCompile = (shader) => {
-    shader.uniforms.uTime = waterUniforms.uTime;
-    shader.vertexShader = shader.vertexShader
-      .replace(
-        '#include <common>',
-        `#include <common>
-         uniform float uTime;
-         varying vec3 vWorldPos;`,
-      )
-      .replace(
-        '#include <begin_vertex>',
-        `#include <begin_vertex>
-         float w1 = sin(position.x * 0.22 + uTime * 2.1) * cos(position.z * 0.18 + uTime * 1.6);
-         float w2 = sin((position.x + position.z) * 0.35 - uTime * 2.7);
-         transformed.y += w1 * 0.14 + w2 * 0.08;`,
-      )
-      .replace(
-        '#include <worldpos_vertex>',
-        `#include <worldpos_vertex>
-         vWorldPos = (modelMatrix * vec4(transformed, 1.0)).xyz;`,
-      );
-
-    shader.fragmentShader = shader.fragmentShader
-      .replace(
-        '#include <common>',
-        `#include <common>
-         uniform float uTime;
-         varying vec3 vWorldPos;`,
-      )
-      .replace(
-        '#include <color_fragment>',
-        `#include <color_fragment>
-         float band = sin(vWorldPos.x * 0.45 + vWorldPos.z * 0.3 + uTime * 2.4)
-                    * cos(vWorldPos.z * 0.55 - uTime * 1.9);
-         float foam = smoothstep(0.68, 0.96, band);
-         diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.76, 0.96, 1.0), foam * 0.38);`,
-      );
-  };
-  const waterMesh = new THREE.Mesh(waterGeo, waterMat);
-  waterMesh.position.set(0, -0.1, -165);
-  waterMesh.receiveShadow = true;
-  scene.add(waterMesh);
-  disposables.push(waterGeo, waterMat);
-
-  // 2. Canyon Banks / Faceted Tropical Cliffs + Instanced Palm Trees
-  const bankRockGeo = new THREE.CylinderGeometry(0.68, 1.05, 1.0, 7);
-  const bankRockMat = new THREE.MeshStandardMaterial({
-    color: 0xffffff,
-    roughness: 0.9,
-    metalness: 0.02,
-    flatShading: true,
-  });
-  const bankInstances: { x: number; y: number; z: number; sx: number; sy: number; sz: number; ry: number; color: number }[] = [];
-  const palmPositions: { x: number; y: number; z: number; scale: number; rotY: number }[] = [];
-
-  for (let z = 14; z >= -340; z -= 6.5) {
-    const bounds = getChannelBoundsAtZ(z, course.waypoints);
-    const isOpenDanger =
-      (z <= -102 && z >= -142) ||
-      (z <= -206 && z >= -252) ||
-      (z <= -280 && z >= -312);
-
-    if (isOpenDanger) {
-      // Open waterfall edge: place warning foam buoys instead of cliff walls
-      bankInstances.push({
-        x: bounds.centerX - bounds.halfWidth - 1.1,
-        y: 0.15,
-        z,
-        sx: 0.55,
-        sy: 0.85,
-        sz: 0.55,
-        ry: z * 0.2,
-        color: 0xff595e,
-      });
-      bankInstances.push({
-        x: bounds.centerX + bounds.halfWidth + 1.1,
-        y: 0.15,
-        z,
-        sx: 0.55,
-        sy: 0.85,
-        sz: 0.55,
-        ry: z * 0.2,
-        color: 0xff595e,
-      });
-      continue;
-    }
-
-    // Walled rocky cliff ledges on left and right + scenic lush terraces
-    for (const side of [-1, 1]) {
-      const rx = bounds.centerX + side * (bounds.halfWidth + 2.8 + (Math.abs(Math.sin(z * 0.4)) * 1.4));
-      const cliffH = 2.6 + Math.abs(Math.sin(z * 0.5)) * 2.2;
-      bankInstances.push({
-        x: rx,
-        y: cliffH * 0.45,
-        z,
-        sx: 3.0 + (Math.abs(Math.cos(z * 0.3)) * 1.2),
-        sy: cliffH,
-        sz: 3.7,
-        ry: z * 0.37 + side,
-        color: side === -1 ? 0xd4a373 : 0xcfa06e,
-      });
-
-      const ridgeH = 5.5 + Math.abs(Math.sin(z * 0.17)) * 4.5;
-      bankInstances.push({
-        x: rx + side * 8.5,
-        y: ridgeH * 0.45,
-        z: z + 2,
-        sx: 6.2,
-        sy: ridgeH,
-        sz: 5.8,
-        ry: z * 0.21,
-        color: 0x588157,
-      });
-
-      // Add tropical palm trees atop cliffs periodically
-      if (Math.abs(Math.round(z)) % 19 === (side > 0 ? 3 : 11)) {
-        palmPositions.push({
-          x: rx + side * 1.2,
-          y: cliffH * 0.85,
-          z,
-          scale: 0.85 + Math.abs(Math.sin(z)) * 0.4,
-          rotY: z * 0.7 + side,
-        });
-      }
-    }
-  }
-
-  const bankMesh = new THREE.InstancedMesh(bankRockGeo, bankRockMat, bankInstances.length);
-  bankMesh.castShadow = true;
-  bankMesh.receiveShadow = true;
-  const dummy = new THREE.Object3D();
-  const c = new THREE.Color();
-  bankInstances.forEach((b, idx) => {
-    dummy.position.set(b.x, b.y, b.z);
-    dummy.rotation.set(0, b.ry, 0);
-    dummy.scale.set(b.sx, b.sy, b.sz);
-    dummy.updateMatrix();
-    bankMesh.setMatrixAt(idx, dummy.matrix);
-    bankMesh.setColorAt(idx, c.setHex(b.color));
-  });
-  bankMesh.instanceMatrix.needsUpdate = true;
-  if (bankMesh.instanceColor) bankMesh.instanceColor.needsUpdate = true;
-  bankMesh.computeBoundingSphere();
-  scene.add(bankMesh);
-  disposables.push(bankRockGeo, bankRockMat);
-
-  // Instanced Tropical Palm Trunks & Frond Canopies
-  if (palmPositions.length > 0) {
-    const trunkGeo = new THREE.CylinderGeometry(0.16, 0.28, 3.6, 7);
-    const trunkMat = new THREE.MeshStandardMaterial({ color: 0x8d5524, roughness: 0.9, flatShading: true });
-    const canopyGeo = new THREE.ConeGeometry(2.1, 1.4, 7);
-    const canopyMat = new THREE.MeshStandardMaterial({ color: 0x40916c, roughness: 0.72, flatShading: true });
-
-    const trunks = new THREE.InstancedMesh(trunkGeo, trunkMat, palmPositions.length);
-    const canopies = new THREE.InstancedMesh(canopyGeo, canopyMat, palmPositions.length);
-    trunks.castShadow = true;
-    canopies.castShadow = true;
-
-    palmPositions.forEach((p, idx) => {
-      dummy.position.set(p.x, p.y + 1.6 * p.scale, p.z);
-      dummy.rotation.set(0.08, p.rotY, 0.1);
-      dummy.scale.setScalar(p.scale);
-      dummy.updateMatrix();
-      trunks.setMatrixAt(idx, dummy.matrix);
-
-      dummy.position.set(p.x + 0.15 * p.scale, p.y + 3.4 * p.scale, p.z);
-      dummy.rotation.set(0, p.rotY, 0);
-      dummy.scale.setScalar(p.scale);
-      dummy.updateMatrix();
-      canopies.setMatrixAt(idx, dummy.matrix);
-    });
-    trunks.instanceMatrix.needsUpdate = true;
-    canopies.instanceMatrix.needsUpdate = true;
-    trunks.computeBoundingSphere();
-    canopies.computeBoundingSphere();
-    scene.add(trunks, canopies);
-    disposables.push(trunkGeo, trunkMat, canopyGeo, canopyMat);
-  }
-
-  // 3. Static Obstacles (Rocks, Pillars, Buoys, Bouncy Bumpers)
-  const bumperMeshes: THREE.Group[] = [];
-  const rockMat = new THREE.MeshStandardMaterial({ color: 0x6c757d, roughness: 0.85, metalness: 0.05 });
-  const pillarMat = new THREE.MeshStandardMaterial({
-    color: 0xffffff,
-    map: textures.woodMap,
-    bumpMap: textures.woodBump,
-    bumpScale: 0.06,
-    roughness: 0.72,
-  });
-  const buoyRedMat = new THREE.MeshStandardMaterial({ color: 0xff595e, roughness: 0.35, metalness: 0.1 });
-  const buoyWhiteMat = new THREE.MeshStandardMaterial({ color: 0xfff8e7, roughness: 0.4 });
-  const bumperBodyMat = new THREE.MeshStandardMaterial({
-    color: 0xf72585,
-    roughness: 0.3,
-    metalness: 0.15,
-    emissive: 0x550028,
-    emissiveIntensity: 0.35,
-  });
-  const bumperRingMat = new THREE.MeshStandardMaterial({
-    color: 0xffbe0b,
-    roughness: 0.25,
-    metalness: 0.5,
-  });
-  disposables.push(rockMat, pillarMat, buoyRedMat, buoyWhiteMat, bumperBodyMat, bumperRingMat);
-
-  for (const obs of course.staticObstacles) {
-    const grp = new THREE.Group();
-    grp.position.set(obs.x, 0, obs.z);
-
-    if (obs.kind === 'rock') {
-      const base = new THREE.Mesh(new THREE.DodecahedronGeometry(obs.radius, 1), rockMat);
-      base.scale.set(1, 0.85, 1);
-      base.position.y = obs.radius * 0.45;
-      base.castShadow = true;
-      base.receiveShadow = true;
-      const cap = new THREE.Mesh(
-        new THREE.DodecahedronGeometry(obs.radius * 0.55, 0),
-        new THREE.MeshStandardMaterial({ color: 0x52b788, roughness: 0.8 }),
-      );
-      cap.position.set(0.2, obs.radius * 0.95, 0.1);
-      grp.add(base, cap);
-    } else if (obs.kind === 'pillar') {
-      const post = new THREE.Mesh(
-        new THREE.CylinderGeometry(obs.radius * 0.82, obs.radius, obs.height, 12),
-        pillarMat,
-      );
-      post.position.y = obs.height * 0.42;
-      post.castShadow = true;
-      const band = new THREE.Mesh(
-        new THREE.CylinderGeometry(obs.radius * 0.88, obs.radius * 0.88, 0.55, 12),
-        buoyRedMat,
-      );
-      band.position.y = obs.height * 0.65;
-      const cap = new THREE.Mesh(new THREE.ConeGeometry(obs.radius * 0.9, 0.8, 12), buoyWhiteMat);
-      cap.position.y = obs.height * 0.9;
-      grp.add(post, band, cap);
-    } else if (obs.kind === 'buoy') {
-      const floatRing = new THREE.Mesh(new THREE.TorusGeometry(obs.radius * 0.72, 0.35, 10, 18), buoyRedMat);
-      floatRing.rotation.x = Math.PI / 2;
-      floatRing.position.y = 0.25;
-      const mast = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.22, obs.height, 10), buoyWhiteMat);
-      mast.position.y = obs.height * 0.5;
-      const beacon = new THREE.Mesh(
-        new THREE.SphereGeometry(0.32, 10, 8),
-        new THREE.MeshStandardMaterial({ color: 0xffd166, emissive: 0xffaa00, emissiveIntensity: 0.9 }),
-      );
-      beacon.position.y = obs.height;
-      grp.add(floatRing, mast, beacon);
-    } else if (obs.kind === 'bumper') {
-      const sphere = new THREE.Mesh(new THREE.SphereGeometry(obs.radius * 0.85, 16, 12), bumperBodyMat);
-      sphere.position.y = 0.65;
-      sphere.castShadow = true;
-      const ring = new THREE.Mesh(new THREE.TorusGeometry(obs.radius * 0.92, 0.22, 10, 20), bumperRingMat);
-      ring.rotation.x = Math.PI / 2;
-      ring.position.y = 0.65;
-      const topCap = new THREE.Mesh(new THREE.ConeGeometry(0.45, 0.7, 10), bumperRingMat);
-      topCap.position.y = 1.65;
-      grp.add(sphere, ring, topCap);
-      bumperMeshes.push(grp);
-    }
-
-    scene.add(grp);
-  }
-
-  // 4. Moving Gates (Composite striped log barrier + support buoys)
-  const movingGateMeshes = new Map<string, THREE.Group>();
-  const stripeMat = new THREE.MeshStandardMaterial({
-    color: 0xffffff,
-    map: textures.hazardStripeMap,
-    roughness: 0.45,
-    metalness: 0.1,
-  });
-  disposables.push(stripeMat);
-
-  for (const gate of course.movingGates) {
-    const grp = new THREE.Group();
-    grp.position.set(gate.baseX, 0, gate.z);
-
-    const beam = new THREE.Mesh(
-      new THREE.BoxGeometry(gate.halfWidth * 2, 1.35, gate.depth),
-      stripeMat,
-    );
-    beam.position.y = 0.72;
-    beam.castShadow = true;
-    beam.receiveShadow = true;
-
-    const endPostL = new THREE.Mesh(new THREE.CylinderGeometry(0.55, 0.65, 2.2, 12), buoyRedMat);
-    endPostL.position.set(-gate.halfWidth, 0.95, 0);
-    const endPostR = new THREE.Mesh(new THREE.CylinderGeometry(0.55, 0.65, 2.2, 12), buoyRedMat);
-    endPostR.position.set(gate.halfWidth, 0.95, 0);
-
-    grp.add(beam, endPostL, endPostR);
-    scene.add(grp);
-    movingGateMeshes.set(gate.id, grp);
-  }
-
-  // 5. Boost Current Pads
-  const boostMeshes: THREE.Mesh[] = [];
-  const boostMat = new THREE.MeshStandardMaterial({
-    color: 0x00f5d4,
-    emissive: 0x00bbf9,
-    emissiveIntensity: 0.85,
-    transparent: true,
-    opacity: 0.65,
-    roughness: 0.2,
-  });
-  disposables.push(boostMat);
-
-  for (const pad of course.boostPads) {
-    const ring = new THREE.Mesh(new THREE.RingGeometry(pad.radius * 0.45, pad.radius, 24), boostMat);
-    ring.rotation.x = -Math.PI / 2;
-    ring.position.set(pad.x, 0.04, pad.z);
-    scene.add(ring);
-    boostMeshes.push(ring);
-  }
-
-  // 6. Checkpoints (Arch + Flag + Glowing Water Ring)
-  const checkpointFlags = new Map<number, THREE.Mesh>();
-  const checkpointRings = new Map<number, THREE.Mesh>();
-
-  for (const cp of course.checkpoints) {
-    if (cp.index === 0) continue; // Start bay doesn't need a checkpoint gate
-
-    const cpGroup = new THREE.Group();
-    cpGroup.position.set(cp.x, 0, cp.z);
-
-    const ringMat = new THREE.MeshStandardMaterial({
-      color: 0xffd166,
-      emissive: 0xffaa00,
-      emissiveIntensity: 0.6,
-      transparent: true,
-      opacity: 0.7,
-    });
-    const ring = new THREE.Mesh(new THREE.RingGeometry(cp.radius * 0.85, cp.radius, 32), ringMat);
-    ring.rotation.x = -Math.PI / 2;
-    ring.position.y = 0.05;
-    cpGroup.add(ring);
-    checkpointRings.set(cp.index, ring);
-
-    // Side Checkpoint Island Tower with Flag
-    const poleX = cp.x + 8.2;
-    const island = new THREE.Mesh(
-      new THREE.CylinderGeometry(2.2, 2.7, 1.2, 12),
-      new THREE.MeshStandardMaterial({ color: 0xe9c46a, roughness: 0.88 }),
-    );
-    island.position.set(8.2, 0.3, 0);
-    const pole = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.14, 0.18, 6.2, 10),
-      buoyWhiteMat,
-    );
-    pole.position.set(8.2, 3.2, 0);
-    const flag = new THREE.Mesh(
-      new THREE.BoxGeometry(2.4, 1.2, 0.12),
-      new THREE.MeshStandardMaterial({ color: 0xff595e, roughness: 0.4 }),
-    );
-    flag.position.set(9.4, 2.2, 0);
-    cpGroup.add(island, pole, flag);
-    checkpointFlags.set(cp.index, flag);
-    void poleX;
-
-    scene.add(cpGroup);
-  }
-
-  // 7. Grand Finish Line Arch
-  const finishGroup = new THREE.Group();
-  finishGroup.position.set(course.finishX, 0, course.finishZ);
-
-  const archSpan = course.finishHalfWidth * 1.9;
-  const pillarL = new THREE.Mesh(new THREE.CylinderGeometry(0.65, 0.85, 9.5, 14), buoyRedMat);
-  pillarL.position.set(-archSpan * 0.5, 4.5, 0);
-  pillarL.castShadow = true;
-  const pillarR = new THREE.Mesh(new THREE.CylinderGeometry(0.65, 0.85, 9.5, 14), buoyRedMat);
-  pillarR.position.set(archSpan * 0.5, 4.5, 0);
-  pillarR.castShadow = true;
-
-  const bannerMat = new THREE.MeshStandardMaterial({
-    color: 0xffffff,
-    map: textures.finishCheckerMap,
-    roughness: 0.4,
-  });
-  const banner = new THREE.Mesh(new THREE.BoxGeometry(archSpan + 1.2, 2.4, 0.7), bannerMat);
-  banner.position.set(0, 8.2, 0);
-  banner.castShadow = true;
-  disposables.push(bannerMat);
-
-  const finishGlow = new THREE.Mesh(
-    new THREE.PlaneGeometry(archSpan, 2.2),
-    new THREE.MeshBasicMaterial({
-      color: 0x06d6a0,
-      transparent: true,
-      opacity: 0.45,
-      side: THREE.DoubleSide,
-      depthWrite: false,
-    }),
-  );
-  finishGlow.rotation.x = -Math.PI / 2;
-  finishGlow.position.y = 0.06;
-
-  finishGroup.add(pillarL, pillarR, banner, finishGlow);
-  scene.add(finishGroup);
-
-  return {
-    waterMat,
-    waterUniforms,
-    movingGateMeshes,
-    bumperMeshes,
-    checkpointFlags,
-    checkpointRings,
-    boostMeshes,
-    dispose: () => {
-      for (const d of disposables) d.dispose();
-    },
-  };
+  return buildCourseWorld(scene, textures, course);
 }

@@ -1,15 +1,29 @@
 import {
+  GAME_VERSION,
   makeEnvelope,
   PROTOCOL_VERSION,
+  type GameEmoteBroadcastPayload,
   type HttpErrorResponse,
+  type NextRoundAction,
   type ProtocolEnvelope,
+  type PublicRoomsListResponse,
+  type QuickMatchHttpRequest,
+  type RoomPublicInfoResponse,
   type RoomSessionCredentials,
+  type SeatSlotOrSpectator,
   type ServerProtocolMessage,
+  type SpectateJoinMode,
 } from '../shared/protocol.ts';
 import type {
+  ChatMessage,
   ConnectionStatus,
+  CourseId,
+  CourseSelectionMode,
+  EmoteId,
   PlayerCosmetic,
   PlayerRole,
+  PlaylistItem,
+  RoomSettings,
   RoomSnapshot,
   SimEvent,
 } from '../shared/types.ts';
@@ -18,12 +32,19 @@ export interface MultiplayerCallbacks {
   onJoined: (data: {
     roomCode: string;
     playerId: string;
+    slot: SeatSlotOrSpectator;
+    role: PlayerRole;
+    snapshot: RoomSnapshot;
+  }) => void;
+  onPromoted?: (data: {
     slot: 0 | 1 | 2 | 3;
     role: PlayerRole;
     snapshot: RoomSnapshot;
   }) => void;
   onState: (snapshot: RoomSnapshot) => void;
   onEvents?: (events: SimEvent[]) => void;
+  onChatMessage?: (message: ChatMessage) => void;
+  onEmote?: (emote: GameEmoteBroadcastPayload) => void;
   onError: (message: string, code?: string) => void;
   onConnectionChange: (status: ConnectionStatus) => void;
 }
@@ -32,12 +53,26 @@ const INPUT_KEEPALIVE_MS = 850;
 const MAX_RECONNECT_ATTEMPTS = 7;
 const RESYNC_THROTTLE_MS = 1500;
 
+function isLocalDevHost(): boolean {
+  if (typeof window === 'undefined') return false;
+  const host = window.location.hostname;
+  const params = new URLSearchParams(window.location.search);
+  if (params.get('remote') === '1') return false;
+  return import.meta.env?.DEV === true && (host === 'localhost' || host === '127.0.0.1');
+}
+
 function getApiBaseUrl(): string {
+  if (isLocalDevHost()) return '';
   const configured = (import.meta.env?.VITE_API_BASE_URL as string | undefined)?.trim();
   return configured ? configured.replace(/\/+$/, '') : '';
 }
 
 function getWsBaseUrl(): string {
+  if (isLocalDevHost()) {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return `${protocol}//${window.location.host}`;
+  }
+
   const configuredWs = (import.meta.env?.VITE_WS_BASE_URL as string | undefined)?.trim();
   if (configuredWs) return configuredWs.replace(/\/+$/, '');
 
@@ -56,6 +91,7 @@ export class MultiplayerClient {
   private lastInputKey = '';
   private currentMoveDir: -1 | 0 | 1 = 0;
   private currentFarting = false;
+  private currentAnchor = false;
   private seq = 0;
   private requestCounter = 0;
 
@@ -74,6 +110,7 @@ export class MultiplayerClient {
   private sessionId: string | null = null;
   private connectionEpoch = 0;
   private role: PlayerRole = 'PLAYER';
+  private currentSlot: SeatSlotOrSpectator = 0;
 
   private connectionStatus: ConnectionStatus = 'disconnected';
   private intentionalLeave = false;
@@ -83,9 +120,14 @@ export class MultiplayerClient {
   private pendingRoomRequest: Promise<void> | null = null;
   private pendingRoomSignature: string | null = null;
   private pendingIdempotency: { signature: string; key: string } | null = null;
+  private accountToken: string | null = null;
 
   constructor(callbacks: MultiplayerCallbacks) {
     this.callbacks = callbacks;
+  }
+
+  public setAccountToken(token: string | null): void {
+    this.accountToken = token && token.trim().length > 0 ? token.trim() : null;
   }
 
   public getLastLatencyMs(): number {
@@ -126,12 +168,12 @@ export class MultiplayerClient {
   }
 
   private syncInputKeepaliveTimer(): void {
-    const isHoldingInput = this.currentFarting || this.currentMoveDir !== 0;
+    const isHoldingInput = this.currentFarting || this.currentMoveDir !== 0 || this.currentAnchor;
     if (isHoldingInput && this.ws && this.ws.readyState === WebSocket.OPEN) {
       if (this.inputKeepaliveTimer === null) {
         this.inputKeepaliveTimer = window.setInterval(() => {
           if (
-            (this.currentFarting || this.currentMoveDir !== 0) &&
+            (this.currentFarting || this.currentMoveDir !== 0 || this.currentAnchor) &&
             this.ws &&
             this.ws.readyState === WebSocket.OPEN
           ) {
@@ -140,6 +182,7 @@ export class MultiplayerClient {
               makeEnvelope('input:state', {
                 moveDir: this.currentMoveDir,
                 farting: this.currentFarting,
+                anchor: this.currentAnchor,
                 seq: this.seq,
               }),
             );
@@ -161,6 +204,8 @@ export class MultiplayerClient {
         {
           playerId: this.playerId,
           resumeToken: this.resumeToken,
+          protocolVersion: PROTOCOL_VERSION,
+          clientVersion: GAME_VERSION,
         },
         this.nextRequestId(),
       ),
@@ -190,6 +235,7 @@ export class MultiplayerClient {
     this.clearActiveSocket(reason);
     this.currentMoveDir = 0;
     this.currentFarting = false;
+    this.currentAnchor = false;
     this.lastInputKey = '';
     this.lastSnapshotSeq = 0;
     this.lastEventId = 0;
@@ -198,6 +244,8 @@ export class MultiplayerClient {
     this.resumeToken = null;
     this.sessionId = null;
     this.connectionEpoch = 0;
+    this.role = 'PLAYER';
+    this.currentSlot = 0;
     this.setStatus('disconnected');
   }
 
@@ -226,8 +274,8 @@ export class MultiplayerClient {
       this.connect(this.roomCode, true)
         .then(() => {
           this.lastInputKey = '';
-          if (this.currentFarting || this.currentMoveDir !== 0) {
-            this.sendInput(this.currentMoveDir, this.currentFarting, true);
+          if (this.currentFarting || this.currentMoveDir !== 0 || this.currentAnchor) {
+            this.sendInput(this.currentMoveDir, this.currentFarting, true, this.currentAnchor, false);
           }
         })
         .catch(() => {
@@ -294,6 +342,7 @@ export class MultiplayerClient {
             this.sessionId = msg.payload!.sessionId;
             this.connectionEpoch = msg.payload!.connectionEpoch;
             this.role = msg.payload!.role;
+            this.currentSlot = msg.payload!.slot;
             this.seq = 0;
             this.setStatus('connected');
             break;
@@ -305,6 +354,7 @@ export class MultiplayerClient {
             this.sessionId = msg.payload!.sessionId;
             this.connectionEpoch = msg.payload!.connectionEpoch;
             this.role = msg.payload!.role;
+            this.currentSlot = msg.payload!.slot;
             this.lastSnapshotSeq = snap.snapshotSeq;
             this.lastEventId = Math.max(this.lastEventId, snap.sim.eventSeq ?? 0);
             this.setStatus('connected');
@@ -323,6 +373,18 @@ export class MultiplayerClient {
             if (snap.snapshotSeq < this.lastSnapshotSeq) return;
             this.lastSnapshotSeq = snap.snapshotSeq;
             this.lastEventId = Math.max(this.lastEventId, snap.sim.eventSeq ?? 0);
+            if (this.currentSlot === -1 && this.playerId) {
+              const promotedIdx = snap.sim.players.findIndex((p) => p.id === this.playerId);
+              if (promotedIdx >= 0) {
+                this.currentSlot = promotedIdx as 0 | 1 | 2 | 3;
+                this.role = snap.hostId === this.playerId ? 'HOST' : 'PLAYER';
+                this.callbacks.onPromoted?.({
+                  slot: this.currentSlot,
+                  role: this.role,
+                  snapshot: snap,
+                });
+              }
+            }
             this.callbacks.onState(snap);
             break;
           }
@@ -353,6 +415,16 @@ export class MultiplayerClient {
             break;
           }
 
+          case 'chat:message': {
+            this.callbacks.onChatMessage?.(msg.payload!.message);
+            break;
+          }
+
+          case 'game:emote': {
+            this.callbacks.onEmote?.(msg.payload!);
+            break;
+          }
+
           case 'pong':
             if (typeof msg.payload?.clientTime === 'number') {
               this.lastLatencyMs = Math.max(0, Date.now() - msg.payload.clientTime);
@@ -367,7 +439,8 @@ export class MultiplayerClient {
               code === 'UNAUTHORIZED' ||
               code === 'ROOM_NOT_FOUND' ||
               code === 'ROOM_CLOSED' ||
-              code === 'FORBIDDEN_ORIGIN'
+              code === 'FORBIDDEN_ORIGIN' ||
+              code === 'PROTOCOL_MISMATCH'
             ) {
               this.terminateSessionAndCloseSocket(code);
             }
@@ -424,6 +497,7 @@ export class MultiplayerClient {
     this.sessionId = creds.sessionId;
     this.connectionEpoch = creds.connectionEpoch;
     this.role = creds.role;
+    this.currentSlot = creds.slot;
     this.lastSnapshotSeq = 0;
     this.lastEventId = 0;
   }
@@ -446,9 +520,23 @@ export class MultiplayerClient {
   public createRoom(
     name: string,
     cosmetic: PlayerCosmetic,
+    courseOrOpts?:
+      | CourseId
+      | {
+          courseId?: CourseId;
+          isPrivate?: boolean;
+          password?: string;
+          settings?: Partial<RoomSettings>;
+          customIdempotencyKey?: string;
+        },
     customIdempotencyKey?: string,
   ): Promise<void> {
-    const signature = `create:${name.trim()}:${JSON.stringify(cosmetic)}`;
+    const opts =
+      typeof courseOrOpts === 'string'
+        ? { courseId: courseOrOpts, customIdempotencyKey }
+        : { ...(courseOrOpts ?? {}), customIdempotencyKey: courseOrOpts?.customIdempotencyKey ?? customIdempotencyKey };
+    const courseId = opts.courseId;
+    const signature = `create:${name.trim()}:${courseId ?? 'tropical'}:${opts.isPrivate ? 'priv' : 'pub'}:${JSON.stringify(opts.settings ?? {})}:${JSON.stringify(cosmetic)}`;
     if (this.pendingRoomRequest) {
       if (this.pendingRoomSignature === signature) {
         return this.pendingRoomRequest;
@@ -456,7 +544,7 @@ export class MultiplayerClient {
       return Promise.reject(new Error('يوجد طلب اتصال قيد التنفيذ بالفعل، يرجى الانتظار.'));
     }
 
-    const idempotencyKey = this.getOrCreateIdempotencyKey(signature, customIdempotencyKey);
+    const idempotencyKey = this.getOrCreateIdempotencyKey(signature, opts.customIdempotencyKey);
     this.pendingRoomSignature = signature;
 
     const op = (async () => {
@@ -467,8 +555,21 @@ export class MultiplayerClient {
 
       const res = await fetch(`${getApiBaseUrl()}/api/v1/rooms`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ name, cosmetic, idempotencyKey }),
+        headers: {
+          'content-type': 'application/json',
+          'x-game-version': GAME_VERSION,
+          'x-protocol-version': String(PROTOCOL_VERSION),
+        },
+        body: JSON.stringify({
+          name,
+          cosmetic,
+          ...(courseId ? { courseId } : {}),
+          ...(opts.isPrivate ? { isPrivate: true } : {}),
+          ...(opts.password ? { password: opts.password } : {}),
+          ...(opts.settings ? { settings: opts.settings } : {}),
+          ...(this.accountToken ? { accountToken: this.accountToken } : {}),
+          idempotencyKey,
+        }),
       });
 
       if (!res.ok) {
@@ -499,14 +600,26 @@ export class MultiplayerClient {
     roomCode: string,
     name: string,
     cosmetic: PlayerCosmetic,
-    customIdempotencyKey?: string,
+    customIdempotencyKeyOrOpts?:
+      | string
+      | { customIdempotencyKey?: string; password?: string; spectate?: SpectateJoinMode },
+    passwordArg?: string,
   ): Promise<void> {
     const normalizedCode = roomCode.trim().toUpperCase();
     if (!/^[A-Z0-9]{6,10}$/.test(normalizedCode)) {
       return Promise.reject(new Error('رمز الغرفة يجب أن يتكون من 6 إلى 10 أحرف أو أرقام.'));
     }
 
-    const signature = `join:${normalizedCode}:${name.trim()}:${JSON.stringify(cosmetic)}`;
+    const opts =
+      typeof customIdempotencyKeyOrOpts === 'string'
+        ? { customIdempotencyKey: customIdempotencyKeyOrOpts, password: passwordArg, spectate: 'auto' as SpectateJoinMode }
+        : {
+            customIdempotencyKey: customIdempotencyKeyOrOpts?.customIdempotencyKey,
+            password: customIdempotencyKeyOrOpts?.password ?? passwordArg,
+            spectate: customIdempotencyKeyOrOpts?.spectate ?? ('auto' as SpectateJoinMode),
+          };
+
+    const signature = `join:${normalizedCode}:${name.trim()}:${opts.password ?? ''}:${opts.spectate}:${JSON.stringify(cosmetic)}`;
     if (this.pendingRoomRequest) {
       if (this.pendingRoomSignature === signature) {
         return this.pendingRoomRequest;
@@ -514,7 +627,7 @@ export class MultiplayerClient {
       return Promise.reject(new Error('يوجد طلب اتصال قيد التنفيذ بالفعل، يرجى الانتظار.'));
     }
 
-    const idempotencyKey = this.getOrCreateIdempotencyKey(signature, customIdempotencyKey);
+    const idempotencyKey = this.getOrCreateIdempotencyKey(signature, opts.customIdempotencyKey);
     this.pendingRoomSignature = signature;
 
     const op = (async () => {
@@ -525,8 +638,19 @@ export class MultiplayerClient {
 
       const res = await fetch(`${getApiBaseUrl()}/api/v1/rooms/${encodeURIComponent(normalizedCode)}/join`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ name, cosmetic, idempotencyKey }),
+        headers: {
+          'content-type': 'application/json',
+          'x-game-version': GAME_VERSION,
+          'x-protocol-version': String(PROTOCOL_VERSION),
+        },
+        body: JSON.stringify({
+          name,
+          cosmetic,
+          idempotencyKey,
+          spectate: opts.spectate,
+          ...(opts.password ? { password: opts.password } : {}),
+          ...(this.accountToken ? { accountToken: this.accountToken } : {}),
+        }),
       });
 
       if (!res.ok) {
@@ -553,6 +677,89 @@ export class MultiplayerClient {
     return op;
   }
 
+  public async fetchRoomInfo(roomCode: string): Promise<RoomPublicInfoResponse> {
+    const normalizedCode = roomCode.trim().toUpperCase();
+    if (!/^[A-Z0-9]{6,10}$/.test(normalizedCode)) {
+      throw new Error('رمز الغرفة غير صالح.');
+    }
+    const res = await fetch(`${getApiBaseUrl()}/api/v1/rooms/${encodeURIComponent(normalizedCode)}`, {
+      method: 'GET',
+      headers: {
+        'x-game-version': GAME_VERSION,
+        'x-protocol-version': String(PROTOCOL_VERSION),
+      },
+    });
+    if (!res.ok) {
+      const errBody = (await res.json().catch(() => null)) as HttpErrorResponse | null;
+      throw new Error(errBody?.error?.message || 'تعذر العثور على الغرفة.');
+    }
+    return (await res.json()) as RoomPublicInfoResponse;
+  }
+
+  public async fetchPublicRooms(): Promise<PublicRoomsListResponse> {
+    const res = await fetch(`${getApiBaseUrl()}/api/v1/rooms`, {
+      method: 'GET',
+      headers: {
+        'x-game-version': GAME_VERSION,
+        'x-protocol-version': String(PROTOCOL_VERSION),
+      },
+    });
+    if (!res.ok) {
+      const errBody = (await res.json().catch(() => null)) as HttpErrorResponse | null;
+      throw new Error(errBody?.error?.message || 'تعذر جلب قائمة الغرف العامة.');
+    }
+    return (await res.json()) as PublicRoomsListResponse;
+  }
+
+  public quickMatch(req: QuickMatchHttpRequest): Promise<void> {
+    const signature = `quick:${req.name.trim()}:${req.preferredGameMode ?? 'any'}:${req.preferredCourseId ?? 'any'}`;
+    if (this.pendingRoomRequest) {
+      if (this.pendingRoomSignature === signature) {
+        return this.pendingRoomRequest;
+      }
+      return Promise.reject(new Error('يوجد طلب اتصال قيد التنفيذ بالفعل، يرجى الانتظار.'));
+    }
+
+    this.pendingRoomSignature = signature;
+    const op = (async () => {
+      this.terminateSessionAndCloseSocket('NEW_SESSION');
+      this.intentionalLeave = false;
+      this.reconnectAttempts = 0;
+      this.setStatus('connecting');
+
+      const res = await fetch(`${getApiBaseUrl()}/api/v1/rooms/quick-match`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-game-version': GAME_VERSION,
+          'x-protocol-version': String(PROTOCOL_VERSION),
+        },
+        body: JSON.stringify({
+          ...req,
+          ...(this.accountToken && !req.accountToken ? { accountToken: this.accountToken } : {}),
+        }),
+      });
+
+      if (!res.ok) {
+        this.setStatus('disconnected');
+        const errBody = (await res.json().catch(() => null)) as HttpErrorResponse | null;
+        throw new Error(errBody?.error?.message || 'لا توجد غرف عامة متاحة حاليًا.');
+      }
+
+      const creds = (await res.json()) as RoomSessionCredentials;
+      this.applyIssuedCredentials(creds);
+      await this.connect(creds.roomCode, false);
+    })().finally(() => {
+      if (this.pendingRoomRequest === op) {
+        this.pendingRoomRequest = null;
+        this.pendingRoomSignature = null;
+      }
+    });
+
+    this.pendingRoomRequest = op;
+    return op;
+  }
+
   public setReady(ready: boolean): void {
     this.sendEnvelope(makeEnvelope('room:ready', { ready }, this.nextRequestId()));
   }
@@ -565,12 +772,54 @@ export class MultiplayerClient {
     this.sendEnvelope(makeEnvelope('room:toggleBots', { fillBots }, this.nextRequestId()));
   }
 
+  public selectCourse(courseId: CourseId, courseSelectionMode?: CourseSelectionMode): void {
+    this.sendEnvelope(
+      makeEnvelope(
+        'room:selectCourse',
+        {
+          courseId,
+          ...(courseSelectionMode ? { courseSelectionMode } : {}),
+        },
+        this.nextRequestId(),
+      ),
+    );
+  }
+
+  public voteCourse(courseId: CourseId): void {
+    this.sendEnvelope(makeEnvelope('room:voteCourse', { courseId }, this.nextRequestId()));
+  }
+
+  public updateRoomSettings(settings: Partial<RoomSettings>): void {
+    this.sendEnvelope(makeEnvelope('room:updateSettings', { settings }, this.nextRequestId()));
+  }
+
   public startGame(): void {
     this.sendEnvelope(makeEnvelope('room:start', {}, this.nextRequestId()));
   }
 
   public restartGame(): void {
     this.sendEnvelope(makeEnvelope('room:restart', {}, this.nextRequestId()));
+  }
+
+  public setPlaylist(playlist: PlaylistItem[]): void {
+    this.sendEnvelope(makeEnvelope('room:setPlaylist', { playlist }, this.nextRequestId()));
+  }
+
+  public nextRound(opts: {
+    action: NextRoundAction;
+    courseId?: CourseId;
+    settings?: Partial<RoomSettings>;
+    immediate?: boolean;
+  }): void {
+    this.sendEnvelope(makeEnvelope('room:nextRound', opts, this.nextRequestId()));
+  }
+
+  public sendChat(payload: { text?: string; presetId?: string }): void {
+    this.sendEnvelope(makeEnvelope('chat:send', payload, this.nextRequestId()));
+  }
+
+  public triggerEmote(emoteId: EmoteId): void {
+    this.sendEnvelope(makeEnvelope('emote:trigger', { emoteId }, this.nextRequestId()));
   }
 
   public requestResync(): void {
@@ -583,14 +832,29 @@ export class MultiplayerClient {
     );
   }
 
-  public sendInput(moveDir: -1 | 0 | 1, farting: boolean, force = false): void {
+  public sendInput(
+    moveDir: -1 | 0 | 1,
+    farting: boolean,
+    force = false,
+    anchor = false,
+    useItem = false,
+  ): void {
     this.currentMoveDir = moveDir;
     this.currentFarting = farting;
-    const key = `${moveDir}:${farting ? 1 : 0}`;
-    if (force || key !== this.lastInputKey) {
+    this.currentAnchor = anchor;
+    const key = `${moveDir}:${farting ? 1 : 0}:${anchor ? 1 : 0}`;
+    if (force || useItem || key !== this.lastInputKey) {
       this.lastInputKey = key;
       this.seq += 1;
-      this.sendEnvelope(makeEnvelope('input:state', { moveDir, farting, seq: this.seq }));
+      this.sendEnvelope(
+        makeEnvelope('input:state', {
+          moveDir,
+          farting,
+          anchor,
+          ...(useItem ? { useItem: true } : {}),
+          seq: this.seq,
+        }),
+      );
     }
     this.syncInputKeepaliveTimer();
   }
@@ -603,6 +867,7 @@ export class MultiplayerClient {
     this.clearInputKeepalive();
     this.currentMoveDir = 0;
     this.currentFarting = false;
+    this.currentAnchor = false;
     this.lastInputKey = '';
     this.lastSnapshotSeq = 0;
     this.lastEventId = 0;

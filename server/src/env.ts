@@ -2,11 +2,38 @@ export interface RateLimitBinding {
   limit(options: { key: string }): Promise<{ success: boolean }>;
 }
 
+export interface D1ExecResult {
+  count: number;
+  duration: number;
+}
+
+export interface D1Result<T = Record<string, unknown>> {
+  results: T[];
+  success: boolean;
+  meta: Record<string, unknown>;
+}
+
+export interface D1PreparedStatement {
+  bind(...values: unknown[]): D1PreparedStatement;
+  first<T = Record<string, unknown>>(colName?: string): Promise<T | null>;
+  all<T = Record<string, unknown>>(): Promise<D1Result<T>>;
+  run<T = Record<string, unknown>>(): Promise<D1Result<T>>;
+  raw<T = unknown[]>(): Promise<T[]>;
+}
+
+export interface D1DatabaseLike {
+  prepare(query: string): D1PreparedStatement;
+  batch<T = Record<string, unknown>>(statements: D1PreparedStatement[]): Promise<D1Result<T>[]>;
+  exec(query: string): Promise<D1ExecResult>;
+}
+
 export interface Env {
   ROOMS: DurableObjectNamespace;
+  DB?: D1DatabaseLike;
   RATE_LIMITER?: RateLimitBinding;
   ENVIRONMENT?: string;
   ALLOWED_ORIGINS?: string;
+  OPS_ADMIN_KEY?: string;
 }
 
 export const INTERNAL_HEADER_NAME = 'x-raft-internal';

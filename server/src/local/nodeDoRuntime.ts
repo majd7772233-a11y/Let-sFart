@@ -1,7 +1,125 @@
 import { DatabaseSync } from 'node:sqlite';
-import type { Env } from '../env.ts';
+import type { D1DatabaseLike, D1ExecResult, D1PreparedStatement, D1Result, Env } from '../env.ts';
 import { RaftRoom } from '../rooms/RaftRoom.ts';
 import type { SqlCursor, SqlStorageAdapter } from '../rooms/types.ts';
+
+type SqliteBinding = string | number | bigint | Uint8Array | null;
+
+function sanitizeD1Bindings(values: unknown[]): SqliteBinding[] {
+  return values.map((v) => {
+    if (v === undefined || v === null) return null;
+    if (typeof v === 'boolean') return v ? 1 : 0;
+    if (typeof v === 'string' || typeof v === 'number' || typeof v === 'bigint' || v instanceof Uint8Array) {
+      return v;
+    }
+    return JSON.stringify(v);
+  });
+}
+
+class LocalD1PreparedStatement implements D1PreparedStatement {
+  private readonly db: DatabaseSync;
+  private readonly query: string;
+  private readonly bindings: SqliteBinding[];
+
+  constructor(db: DatabaseSync, query: string, bindings: SqliteBinding[] = []) {
+    this.db = db;
+    this.query = query;
+    this.bindings = bindings;
+  }
+
+  public bind(...values: unknown[]): D1PreparedStatement {
+    return new LocalD1PreparedStatement(this.db, this.query, sanitizeD1Bindings(values));
+  }
+
+  private execRows<T>(): { rows: T[]; changes: number } {
+    const stmt = this.db.prepare(this.query);
+    const upper = this.query.trimStart().toUpperCase();
+    const returnsRows =
+      upper.startsWith('SELECT') || upper.startsWith('PRAGMA') || upper.includes('RETURNING');
+    if (returnsRows) {
+      const rows = stmt.all(...this.bindings) as T[];
+      return { rows, changes: 0 };
+    }
+    const info = stmt.run(...this.bindings);
+    return { rows: [], changes: Number(info.changes ?? 0) };
+  }
+
+  public async first<T = Record<string, unknown>>(colName?: string): Promise<T | null> {
+    const { rows } = this.execRows<Record<string, unknown>>();
+    if (rows.length === 0) return null;
+    const row = rows[0];
+    if (colName !== undefined) {
+      return (row[colName] as T) ?? null;
+    }
+    return row as T;
+  }
+
+  public async all<T = Record<string, unknown>>(): Promise<D1Result<T>> {
+    const start = performance.now();
+    const { rows, changes } = this.execRows<T>();
+    return {
+      results: rows,
+      success: true,
+      meta: { duration: performance.now() - start, changes },
+    };
+  }
+
+  public async run<T = Record<string, unknown>>(): Promise<D1Result<T>> {
+    return this.all<T>();
+  }
+
+  public async raw<T = unknown[]>(): Promise<T[]> {
+    const { rows } = this.execRows<Record<string, unknown>>();
+    return rows.map((r) => Object.values(r) as unknown as T);
+  }
+}
+
+export class LocalD1Database implements D1DatabaseLike {
+  private readonly db: DatabaseSync;
+
+  constructor(filename = ':memory:') {
+    this.db = new DatabaseSync(filename);
+  }
+
+  public prepare(query: string): D1PreparedStatement {
+    return new LocalD1PreparedStatement(this.db, query);
+  }
+
+  public async batch<T = Record<string, unknown>>(
+    statements: D1PreparedStatement[],
+  ): Promise<D1Result<T>[]> {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const results: D1Result<T>[] = [];
+      for (const stmt of statements) {
+        results.push(await stmt.all<T>());
+      }
+      this.db.exec('COMMIT');
+      return results;
+    } catch (err) {
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        // ignore rollback error
+      }
+      throw err;
+    }
+  }
+
+  public async exec(query: string): Promise<D1ExecResult> {
+    const start = performance.now();
+    this.db.exec(query);
+    return { count: 1, duration: performance.now() - start };
+  }
+
+  public close(): void {
+    try {
+      this.db.close();
+    } catch {
+      // already closed
+    }
+  }
+}
 
 export function createNodeSqlAdapter(db: DatabaseSync): SqlStorageAdapter {
   let txDepth = 0;
@@ -183,9 +301,11 @@ class LocalDurableObjectId implements DurableObjectId {
 export class LocalDurableObjectNamespace {
   private entries = new Map<string, StoredDoEntry>();
   private env: Env | null = null;
+  private localD1: LocalD1Database | null = null;
 
-  public bindEnv(env: Env): void {
+  public bindEnv(env: Env, localD1?: LocalD1Database): void {
     this.env = env;
+    this.localD1 = localD1 ?? null;
   }
 
   public idFromName(name: string): DurableObjectId {
@@ -346,16 +466,23 @@ export class LocalDurableObjectNamespace {
       }
     }
     this.entries.clear();
+    this.localD1?.close();
   }
 }
 
-export function createLocalWorkerEnv(): { env: Env; namespace: LocalDurableObjectNamespace } {
+export function createLocalWorkerEnv(): {
+  env: Env;
+  namespace: LocalDurableObjectNamespace;
+  d1: LocalD1Database;
+} {
   installLocalWebSocketPairPolyfill();
   const namespace = new LocalDurableObjectNamespace();
+  const d1 = new LocalD1Database(':memory:');
   const env: Env = {
     ROOMS: namespace as unknown as DurableObjectNamespace,
+    DB: d1,
     ENVIRONMENT: 'local-node',
   };
-  namespace.bindEnv(env);
-  return { env, namespace };
+  namespace.bindEnv(env, d1);
+  return { env, namespace, d1 };
 }

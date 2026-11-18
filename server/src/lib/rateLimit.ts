@@ -1,6 +1,6 @@
 import type { SqlStorageAdapter } from '../rooms/types.ts';
 
-export type RateChannel = 'input' | 'control' | 'ping' | 'auth';
+export type RateChannel = 'input' | 'control' | 'ping' | 'auth' | 'chat' | 'emote';
 
 interface BucketConfig {
   capacity: number;
@@ -12,6 +12,10 @@ const CHANNEL_LIMITS: Record<RateChannel, BucketConfig> = {
   input: { capacity: 50, refillPerMs: 45 / 1000 },
   // Control actions (ready, cosmetic, start, restart, toggleBots, resync)
   control: { capacity: 12, refillPerMs: 6 / 1000 },
+  // Chat messages (burst 8, sustain ~1.5/sec)
+  chat: { capacity: 8, refillPerMs: 1.5 / 1000 },
+  // Emotes (burst 6, sustain ~2/sec)
+  emote: { capacity: 6, refillPerMs: 2 / 1000 },
   // Heartbeat pings
   ping: { capacity: 6, refillPerMs: 2 / 1000 },
   // Failed or repeated session authentication attempts per playerId
@@ -33,6 +37,8 @@ export class SessionRateLimiter {
       record = {
         input: { tokens: CHANNEL_LIMITS.input.capacity, lastRefillMs: nowMs },
         control: { tokens: CHANNEL_LIMITS.control.capacity, lastRefillMs: nowMs },
+        chat: { tokens: CHANNEL_LIMITS.chat.capacity, lastRefillMs: nowMs },
+        emote: { tokens: CHANNEL_LIMITS.emote.capacity, lastRefillMs: nowMs },
         ping: { tokens: CHANNEL_LIMITS.ping.capacity, lastRefillMs: nowMs },
         auth: { tokens: CHANNEL_LIMITS.auth.capacity, lastRefillMs: nowMs },
       };

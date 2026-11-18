@@ -1,4 +1,17 @@
-import type { ChannelWaypoint, CourseDefinition, MovingGateDef, PlayerZoneBounds } from './types.ts';
+import { COURSE_FACTORY } from './courses/factory.ts';
+import { COURSE_GLACIAL } from './courses/glacial.ts';
+import { COURSE_STORM } from './courses/storm.ts';
+import { COURSE_TROPICAL } from './courses/tropical.ts';
+import { COURSE_VOLCANIC } from './courses/volcanic.ts';
+import type {
+  ChannelWaypoint,
+  CourseDefinition,
+  CourseId,
+  FallingHazardDef,
+  MovingGateDef,
+  PlayerZoneBounds,
+  WindZoneDef,
+} from './types.ts';
 
 export const RAFT_WIDTH = 5.2;
 export const RAFT_LENGTH = 6.4;
@@ -23,101 +36,41 @@ export const PLAYER_ZONES: readonly [
   { slot: 3, minX: 0.45, maxX: 2.15, defaultX: 1.3, zoneZ: -1.15, label: 'الأمام يمين' },
 ];
 
-// Course travels from z = 0 toward negative Z (-330)
-export const COURSE_MAIN: CourseDefinition = {
-  startZ: 0,
-  finishZ: -320,
-  finishX: 0,
-  finishHalfWidth: 11,
-  waypoints: [
-    // 1. Start Bay (wide & welcoming)
-    { z: 12, centerX: 0, halfWidth: 15 },
-    { z: 0, centerX: 0, halfWidth: 14 },
-    { z: -24, centerX: 0, halfWidth: 13.5 },
-    // 2. Wide Bend Right -> Left
-    { z: -52, centerX: 11, halfWidth: 13 },
-    { z: -80, centerX: 14, halfWidth: 12 },
-    // 3. Narrow Gorge
-    { z: -108, centerX: 2, halfWidth: 8.6 },
-    { z: -136, centerX: -4, halfWidth: 8.4 },
-    // 4. Moving Gates Arena
-    { z: -165, centerX: -4, halfWidth: 12.5 },
-    // 5. Checkpoint 1 Lagoon
-    { z: -186, centerX: 0, halfWidth: 14 },
-    // 6. Sharp Hairpin S-Bend
-    { z: -214, centerX: -15, halfWidth: 10.5 },
-    { z: -242, centerX: 12, halfWidth: 10.5 },
-    // 7. Danger Zone & Checkpoint 2
-    { z: -264, centerX: 6, halfWidth: 11.5 },
-    // 8. Final Gauntlet -> Finish Harbor
-    { z: -292, centerX: 0, halfWidth: 9.5 },
-    { z: -320, centerX: 0, halfWidth: 13.5 },
-    { z: -344, centerX: 0, halfWidth: 15 },
-  ],
-  checkpoints: [
-    { index: 0, z: 0, x: 0, yaw: 0, radius: 6, label: 'نقطة الانطلاق' },
-    { index: 1, z: -186, x: 0, yaw: 0, radius: 7.2, label: 'جزيرة الحفظ الأولى' },
-    { index: 2, z: -264, x: 6, yaw: 0, radius: 6.8, label: 'بوابة الأمان الأخيرة' },
-  ],
-  staticObstacles: [
-    // Gentle tutorial buoys in start bay
-    { id: 'obs-1', kind: 'buoy', x: -6.5, z: -18, radius: 1.5, height: 2.2, restitution: 0.75 },
-    { id: 'obs-2', kind: 'buoy', x: 6.5, z: -24, radius: 1.5, height: 2.2, restitution: 0.75 },
-    // Wide bend rocks
-    { id: 'obs-3', kind: 'rock', x: 3.5, z: -48, radius: 2.4, height: 3.2, restitution: 0.6 },
-    { id: 'obs-4', kind: 'rock', x: 18.5, z: -64, radius: 2.7, height: 3.6, restitution: 0.6 },
-    { id: 'obs-5', kind: 'bumper', x: 10.5, z: -76, radius: 1.9, height: 2.2, restitution: 1.25 },
-    // Narrow gorge pillars
-    { id: 'obs-6', kind: 'pillar', x: -3.2, z: -108, radius: 1.7, height: 4.5, restitution: 0.7 },
-    { id: 'obs-7', kind: 'pillar', x: 5.5, z: -120, radius: 1.8, height: 4.5, restitution: 0.7 },
-    { id: 'obs-8', kind: 'bumper', x: -5.8, z: -132, radius: 1.8, height: 2.2, restitution: 1.25 },
-    // Sharp bend hazards
-    { id: 'obs-9', kind: 'rock', x: -7.5, z: -206, radius: 2.3, height: 3.4, restitution: 0.65 },
-    { id: 'obs-10', kind: 'bumper', x: -16.5, z: -222, radius: 2.0, height: 2.4, restitution: 1.3 },
-    { id: 'obs-11', kind: 'rock', x: 3.0, z: -234, radius: 2.3, height: 3.3, restitution: 0.65 },
-    { id: 'obs-12', kind: 'bumper', x: 14.5, z: -248, radius: 2.0, height: 2.4, restitution: 1.3 },
-    // Final gauntlet buoys
-    { id: 'obs-13', kind: 'pillar', x: -3.6, z: -286, radius: 1.65, height: 4.4, restitution: 0.75 },
-    { id: 'obs-14', kind: 'pillar', x: 3.6, z: -298, radius: 1.65, height: 4.4, restitution: 0.75 },
-  ],
-  movingGates: [
-    {
-      id: 'gate-1',
-      baseX: -4,
-      z: -154,
-      halfWidth: 3.4,
-      depth: 1.6,
-      amplitudeX: 5.4,
-      speed: 1.35,
-      phaseOffset: 0,
-    },
-    {
-      id: 'gate-2',
-      baseX: -4,
-      z: -172,
-      halfWidth: 3.6,
-      depth: 1.6,
-      amplitudeX: 5.6,
-      speed: 1.55,
-      phaseOffset: Math.PI,
-    },
-    {
-      id: 'gate-3',
-      baseX: 0,
-      z: -306,
-      halfWidth: 3.2,
-      depth: 1.6,
-      amplitudeX: 4.6,
-      speed: 1.75,
-      phaseOffset: Math.PI * 0.5,
-    },
-  ],
-  boostPads: [
-    { id: 'boost-1', x: 11, z: -58, radius: 3.2, dirX: 0.25, dirZ: -0.97, strength: 16 },
-    { id: 'boost-2', x: -12, z: -216, radius: 3.2, dirX: 0.35, dirZ: -0.94, strength: 17 },
-    { id: 'boost-3', x: 0, z: -276, radius: 3.4, dirX: 0, dirZ: -1, strength: 18 },
-  ],
+export const VALID_COURSE_IDS: readonly CourseId[] = ['tropical', 'volcanic', 'glacial', 'factory', 'storm'];
+
+export const COURSE_CATALOG: Record<CourseId, CourseDefinition> = {
+  tropical: COURSE_TROPICAL,
+  volcanic: COURSE_VOLCANIC,
+  glacial: COURSE_GLACIAL,
+  factory: COURSE_FACTORY,
+  storm: COURSE_STORM,
 };
+
+export const COURSE_LIST: readonly CourseDefinition[] = VALID_COURSE_IDS.map(
+  (id) => COURSE_CATALOG[id],
+);
+
+// Preserve COURSE_MAIN export alias for full backward compatibility
+export const COURSE_MAIN: CourseDefinition = COURSE_TROPICAL;
+
+export { COURSE_TROPICAL, COURSE_VOLCANIC, COURSE_GLACIAL, COURSE_FACTORY, COURSE_STORM };
+
+export function isValidCourseId(value: unknown): value is CourseId {
+  return (
+    value === 'tropical' ||
+    value === 'volcanic' ||
+    value === 'glacial' ||
+    value === 'factory' ||
+    value === 'storm'
+  );
+}
+
+export function getCourseById(id?: unknown): CourseDefinition {
+  if (isValidCourseId(id)) {
+    return COURSE_CATALOG[id];
+  }
+  return COURSE_TROPICAL;
+}
 
 export function getChannelBoundsAtZ(
   z: number,
@@ -145,6 +98,107 @@ export function getChannelBoundsAtZ(
 
 export function getMovingGateCenterX(gate: MovingGateDef, simTime: number): number {
   return gate.baseX + Math.sin(simTime * gate.speed + gate.phaseOffset) * gate.amplitudeX;
+}
+
+export interface MovingGateTransform {
+  x: number;
+  y: number;
+  z: number;
+  blocksChannel: boolean;
+  warningPulse: number;
+}
+
+/**
+ * Deterministic transform & collision activity for horizontal gates and rhythmic vertical hydraulic pistons.
+ */
+export function getMovingGateTransform(gate: MovingGateDef, simTime: number): MovingGateTransform {
+  if (gate.motion === 'vertical_piston') {
+    const period = Math.max(1.2, gate.slamPeriod ?? 3.6);
+    const closedRatio = Math.max(0.15, Math.min(0.75, gate.closedRatio ?? 0.4));
+    const phase = (((simTime + gate.phaseOffset) % period) + period) % period;
+    const u = phase / period; // 0..1
+
+    // 0 .. (1 - closedRatio - 0.15): raised open high above water (y = 5.4)
+    // warning window before slam: slight hover & strobe
+    // slam down cleanly to y = 0.05 during closed window, then retract smoothly
+    const openEnd = 1 - closedRatio;
+    const transition = 0.12;
+    let y = 5.4;
+    let warningPulse = 0;
+
+    if (u < openEnd - transition) {
+      y = 5.4;
+      if (u > openEnd - transition - 0.18) {
+        warningPulse = 0.6 + 0.4 * Math.sin(simTime * 24);
+      }
+    } else if (u < openEnd) {
+      const k = (u - (openEnd - transition)) / transition;
+      const eased = k * k;
+      y = 5.4 * (1 - eased) + 0.05 * eased;
+      warningPulse = 1;
+    } else if (u < 1 - transition * 0.7) {
+      y = 0.05;
+      warningPulse = 0.35;
+    } else {
+      const k = (u - (1 - transition * 0.7)) / (transition * 0.7);
+      y = 0.05 * (1 - k) + 5.4 * k;
+    }
+
+    return {
+      x: gate.baseX,
+      y,
+      z: gate.z,
+      blocksChannel: y <= 1.55,
+      warningPulse,
+    };
+  }
+
+  return {
+    x: getMovingGateCenterX(gate, simTime),
+    y: Math.sin(simTime * 2.5 + gate.phaseOffset) * 0.08,
+    z: gate.z,
+    blocksChannel: true,
+    warningPulse: 0,
+  };
+}
+
+export function isWindZoneActive(zone: WindZoneDef, simTime: number): boolean {
+  if (!zone.cyclePeriod || zone.cyclePeriod <= 0) {
+    return true;
+  }
+  const duty = zone.dutyCycle ?? 0.6;
+  const offset = zone.phaseOffset ?? 0;
+  const phase = (((simTime + offset) % zone.cyclePeriod) + zone.cyclePeriod) % zone.cyclePeriod;
+  return phase / zone.cyclePeriod < duty;
+}
+
+/**
+ * Returns deterministic falling-hazard cycle phase in [0, 1).
+ * 0.0 -> impact moment; last `warningFraction` before 1.0 -> telegraph warning + descending rock!
+ */
+export function getFallingHazardCycle(
+  hazard: FallingHazardDef,
+  simTime: number,
+): {
+  cycleU: number;
+  timeUntilImpact: number;
+  inWarning: boolean;
+  heightY: number;
+} {
+  const period = Math.max(1.5, hazard.period);
+  const phase = (((simTime + hazard.phaseOffset) % period) + period) % period;
+  const timeUntilImpact = period - phase;
+  const inWarning = timeUntilImpact <= hazard.warningDuration;
+  const warningFrac = inWarning ? 1 - timeUntilImpact / hazard.warningDuration : 0;
+  // Drop from y = 26 -> y = 0.3 accelerating quadratically during warning window
+  const heightY = inWarning ? 26 * Math.pow(1 - warningFrac, 1.85) + 0.35 : 34;
+
+  return {
+    cycleU: phase / period,
+    timeUntilImpact,
+    inWarning,
+    heightY,
+  };
 }
 
 export function getCourseProgress(z: number, course: CourseDefinition = COURSE_MAIN): number {

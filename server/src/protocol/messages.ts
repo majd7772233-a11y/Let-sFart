@@ -1,5 +1,7 @@
 import {
   makeEnvelope,
+  type ChatMessageBroadcastPayload,
+  type GameEmoteBroadcastPayload,
   type ProtocolErrorCode,
   type RoomJoinedPayload,
   type ServerProtocolMessage,
@@ -32,6 +34,20 @@ export function makeGameSnapshotMsg(snapshot: RoomSnapshot): ServerProtocolMessa
 
 export function makeGameEventMsg(events: SimEvent[]): ServerProtocolMessage {
   return makeEnvelope('game:event', { events });
+}
+
+export function makeChatMessageMsg(
+  payload: ChatMessageBroadcastPayload,
+  requestId?: string,
+): ServerProtocolMessage {
+  return makeEnvelope('chat:message', payload, requestId);
+}
+
+export function makeGameEmoteMsg(
+  payload: GameEmoteBroadcastPayload,
+  requestId?: string,
+): ServerProtocolMessage {
+  return makeEnvelope('game:emote', payload, requestId);
 }
 
 export function makeRoomErrorMsg(

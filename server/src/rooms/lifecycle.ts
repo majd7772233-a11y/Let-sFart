@@ -1,7 +1,11 @@
+import { getDefaultBotPersonality } from '../../../src/shared/bots.ts';
 import { createPlayerState } from '../../../src/shared/physics.ts';
 import type { RoomLifecycleState, SeatStatus } from '../../../src/shared/types.ts';
 import { ProtocolError } from '../protocol/errors.ts';
+import { opsMetrics } from '../services/metrics.ts';
+import { isSpectatorSession } from './sessions.ts';
 import {
+  BOT_SUBSTITUTE_DELAY_MS,
   MAX_PLAYERS,
   RECONNECT_GRACE_MS,
   ROOM_EMPTY_CLOSE_MS,
@@ -12,7 +16,7 @@ import {
 
 const ALLOWED_TRANSITIONS: Record<RoomLifecycleState, readonly RoomLifecycleState[]> = {
   CREATING: ['WAITING', 'CLOSED'],
-  WAITING: ['PLAYING', 'CLOSED'],
+  WAITING: ['PLAYING', 'RESTARTING', 'CLOSED'],
   PLAYING: ['FALLING', 'FINISHED', 'RESTARTING', 'CLOSED'],
   FALLING: ['PLAYING', 'FINISHED', 'RESTARTING', 'CLOSED'],
   FINISHED: ['RESTARTING', 'CLOSED'],
@@ -46,6 +50,22 @@ export function getActiveSessionForSlot(
     }
   }
   return null;
+}
+
+export function getSpectatorSessions(room: RoomRecord): PlayerSessionRecord[] {
+  return Array.from(room.sessions.values())
+    .filter((s) => !s.revoked && isSpectatorSession(s))
+    .sort((a, b) => a.joinedAt - b.joinedAt);
+}
+
+export function countActiveSpectators(room: RoomRecord): number {
+  let count = 0;
+  for (const session of room.sessions.values()) {
+    if (!session.revoked && isSpectatorSession(session)) {
+      count += 1;
+    }
+  }
+  return count;
 }
 
 export function getSeatKind(
@@ -88,6 +108,11 @@ export function getSeatStatusSnapshot(
   }
 }
 
+export function getEffectiveMaxPlayers(room: RoomRecord): number {
+  const configured = room.settings?.maxPlayers ?? MAX_PLAYERS;
+  return Math.max(2, Math.min(MAX_PLAYERS, configured));
+}
+
 /**
  * Finds an open seat slot (prefers genuinely EMPTY or BOT slots; never steals a seat in grace period or reserved in-flight).
  */
@@ -96,7 +121,8 @@ export function findAvailableSeatSlot(
   nowMs = Date.now(),
   reservedSlots?: ReadonlySet<number>,
 ): 0 | 1 | 2 | 3 | null {
-  for (let i = 0; i < MAX_PLAYERS; i++) {
+  const limit = getEffectiveMaxPlayers(room);
+  for (let i = 0; i < limit; i++) {
     const slot = i as 0 | 1 | 2 | 3;
     if (reservedSlots?.has(slot)) continue;
     const kind = getSeatKind(room, slot, nowMs);
@@ -108,28 +134,158 @@ export function findAvailableSeatSlot(
 }
 
 /**
- * Synchronizes the 4 raft seats cleanly:
- * - HUMAN_CONNECTED: human stays connected, isBot=false
- * - HUMAN_DISCONNECTED_GRACE: human keeps their seat/cosmetic/name with connected=false, isBot=false (NOT replaced by bot!)
- * - EMPTY or expired: replaced by Bot if fillBots=true, or Empty placeholder if fillBots=false
+ * ONLINE-07: Promotes queued spectators (earliest joined connected spectators first)
+ * into any open player seats up to maxPlayers when entering WAITING / next round.
  */
-export function syncBotsInRoom(room: RoomRecord, nowMs = Date.now()): void {
+export function promoteWaitingSpectators(
+  room: RoomRecord,
+  nowMs = Date.now(),
+  reservedSlots?: ReadonlySet<number>,
+): string[] {
+  const spectators = getSpectatorSessions(room).sort((a, b) => {
+    if (a.connected !== b.connected) return a.connected ? -1 : 1;
+    return a.joinedAt - b.joinedAt;
+  });
+
+  const promotedIds: string[] = [];
+  const hasValidHost = (() => {
+    const host = room.sessions.get(room.hostId);
+    return Boolean(
+      host &&
+        !host.revoked &&
+        !isSpectatorSession(host) &&
+        (host.connected || (nowMs - host.lastSeenAt <= RECONNECT_GRACE_MS && nowMs < host.expiresAt)),
+    );
+  })();
+
+  let assignedHostAlready = hasValidHost;
+
+  for (const spec of spectators) {
+    const openSlot = findAvailableSeatSlot(room, nowMs, reservedSlots);
+    if (openSlot === null) break;
+
+    spec.slot = openSlot;
+    spec.role = assignedHostAlready ? 'PLAYER' : 'HOST';
+    if (!assignedHostAlready) {
+      room.hostId = spec.playerId;
+      assignedHostAlready = true;
+    }
+    spec.ready = spec.role === 'HOST';
+
+    const p = room.sim.players[openSlot];
+    p.id = spec.playerId;
+    p.name = spec.name;
+    p.cosmetic = spec.cosmetic;
+    p.isBot = false;
+    p.connected = spec.connected;
+    p.ready = spec.ready;
+    p.seatStatus = spec.connected ? 'CONNECTED' : 'RECONNECTING';
+    if (spec.accountId) p.accountId = spec.accountId;
+    if (spec.playerLevel) p.playerLevel = spec.playerLevel;
+    promotedIds.push(spec.playerId);
+  }
+
+  return promotedIds;
+}
+
+/**
+ * BOT-04: During active gameplay (PLAYING / FALLING), if a seated human player remains disconnected
+ * for >= BOT_SUBSTITUTE_DELAY_MS inside the 15s grace window, activate temporary AI takeover
+ * while keeping their seat, identity, cosmetic, and reconnect rights intact.
+ */
+export function activateTempBotSubstitutesIfNeeded(
+  room: RoomRecord,
+  nowMs = Date.now(),
+): boolean {
+  if (room.lifecycleState !== 'PLAYING' && room.lifecycleState !== 'FALLING') {
+    return false;
+  }
+
+  let changed = false;
+  let newlyActivated = 0;
+
   for (let i = 0; i < MAX_PLAYERS; i++) {
     const slot = i as 0 | 1 | 2 | 3;
     const session = getActiveSessionForSlot(room, slot);
+    const p = room.sim.players[slot];
+    if (!session || !p) continue;
+
+    if (session.connected) {
+      if (p.tempBotSubstitute) {
+        p.tempBotSubstitute = false;
+        p.isBot = false;
+        p.connected = true;
+        p.seatStatus = 'CONNECTED';
+        changed = true;
+      }
+      continue;
+    }
+
+    const elapsedDisconnected = nowMs - session.lastSeenAt;
+    const inGrace = elapsedDisconnected <= RECONNECT_GRACE_MS && nowMs < session.expiresAt;
+    if (inGrace && elapsedDisconnected >= BOT_SUBSTITUTE_DELAY_MS && !p.tempBotSubstitute) {
+      p.tempBotSubstitute = true;
+      p.isBot = true;
+      p.connected = true;
+      p.seatStatus = 'RECONNECTING';
+      p.botPersonality = room.settings?.botPersonalities?.[slot] ?? getDefaultBotPersonality(slot);
+      changed = true;
+      newlyActivated += 1;
+    }
+  }
+
+  if (newlyActivated > 0) {
+    opsMetrics.recordTempSubstituteActivated(newlyActivated);
+  }
+  return changed;
+}
+
+/**
+ * Synchronizes the 4 raft seats cleanly:
+ * - HUMAN_CONNECTED: human stays connected, isBot=false
+ * - HUMAN_DISCONNECTED_GRACE: human keeps their seat/cosmetic/name; if active gameplay >= 6s, tempBotSubstitute assists
+ * - Slot >= maxPlayers: forced to EMPTY unless an active session holds it
+ * - EMPTY or expired within maxPlayers: replaced by Bot if fillBots=true, or Empty placeholder if fillBots=false
+ */
+export function syncBotsInRoom(room: RoomRecord, nowMs = Date.now()): void {
+  const limit = getEffectiveMaxPlayers(room);
+  room.sim.botDifficulty = room.settings?.botDifficulty ?? 'normal';
+  const isActiveGame = room.lifecycleState === 'PLAYING' || room.lifecycleState === 'FALLING';
+
+  for (let i = 0; i < MAX_PLAYERS; i++) {
+    const slot = i as 0 | 1 | 2 | 3;
+    const session = getActiveSessionForSlot(room, slot);
+    const personality = room.settings?.botPersonalities?.[slot] ?? getDefaultBotPersonality(slot);
 
     if (session) {
-      const inGrace = session.connected || (nowMs - session.lastSeenAt <= RECONNECT_GRACE_MS && nowMs < session.expiresAt);
+      const elapsedDisconnected = nowMs - session.lastSeenAt;
+      const inGrace =
+        session.connected || (elapsedDisconnected <= RECONNECT_GRACE_MS && nowMs < session.expiresAt);
       if (inGrace) {
         const p = room.sim.players[slot];
         p.id = session.playerId;
         p.name = session.name;
         p.cosmetic = session.cosmetic;
-        p.isBot = false;
-        p.connected = session.connected;
         p.ready = session.ready;
-        p.seatStatus = session.connected ? 'CONNECTED' : 'RECONNECTING';
-        if (!session.connected) {
+        p.botPersonality = personality;
+        if (session.accountId) p.accountId = session.accountId;
+        if (session.playerLevel) p.playerLevel = session.playerLevel;
+
+        if (session.connected) {
+          p.tempBotSubstitute = false;
+          p.isBot = false;
+          p.connected = true;
+          p.seatStatus = 'CONNECTED';
+        } else if (isActiveGame && elapsedDisconnected >= BOT_SUBSTITUTE_DELAY_MS) {
+          p.tempBotSubstitute = true;
+          p.isBot = true;
+          p.connected = true;
+          p.seatStatus = 'RECONNECTING';
+        } else {
+          p.tempBotSubstitute = false;
+          p.isBot = false;
+          p.connected = false;
+          p.seatStatus = 'RECONNECTING';
           p.farting = false;
           p.moveDir = 0;
         }
@@ -137,16 +293,20 @@ export function syncBotsInRoom(room: RoomRecord, nowMs = Date.now()): void {
       }
     }
 
-    if (room.fillBots) {
+    if (i < limit && room.fillBots) {
       const existing = room.sim.players[slot];
-      if (!existing || !existing.isBot || !existing.connected) {
+      if (!existing || !existing.isBot || !existing.connected || existing.tempBotSubstitute) {
         const bot = createPlayerState(slot, { isBot: true, connected: true });
         bot.ready = true;
         bot.seatStatus = 'BOT';
+        bot.tempBotSubstitute = false;
+        bot.botPersonality = personality;
         room.sim.players[slot] = bot;
       } else {
         existing.ready = true;
         existing.seatStatus = 'BOT';
+        existing.tempBotSubstitute = false;
+        existing.botPersonality = personality;
       }
     } else {
       const empty = createPlayerState(slot, {
@@ -156,19 +316,21 @@ export function syncBotsInRoom(room: RoomRecord, nowMs = Date.now()): void {
         connected: false,
       });
       empty.seatStatus = 'EMPTY';
+      empty.tempBotSubstitute = false;
+      empty.botPersonality = personality;
       room.sim.players[slot] = empty;
     }
   }
 }
 
 /**
- * Checks whether all active human players are ready before starting a round.
- * Bots are automatically ready; Host is ready by policy; disconnected-in-grace humans block start until ready or expired.
+ * Checks whether all active seated human players are ready before starting a round.
+ * Spectators never block the host from starting!
  */
 export function validateAllHumansReady(room: RoomRecord): { ok: true } | { ok: false; unreadyNames: string[] } {
   const unreadyNames: string[] = [];
   for (const session of room.sessions.values()) {
-    if (session.revoked) continue;
+    if (session.revoked || isSpectatorSession(session)) continue;
     if (!session.ready) {
       unreadyNames.push(session.name);
     }
@@ -182,13 +344,14 @@ export function validateAllHumansReady(room: RoomRecord): { ok: true } | { ok: f
 /**
  * Elects a new host only when the current host permanently left or their 15s reconnect grace expired.
  * If the host is temporarily disconnected within grace, they retain HOST role!
+ * Spectators are never elected host unless all seated players are gone (then earliest spectator is promoted).
  */
 export function reconcileHostLeadership(
   room: RoomRecord,
   nowMs = Date.now(),
 ): { hostChanged: boolean; newHostId: string } {
   const currentHostSession = room.sessions.get(room.hostId);
-  if (currentHostSession && !currentHostSession.revoked) {
+  if (currentHostSession && !currentHostSession.revoked && !isSpectatorSession(currentHostSession)) {
     const hostStillValid =
       currentHostSession.connected ||
       (nowMs - currentHostSession.lastSeenAt <= RECONNECT_GRACE_MS && nowMs < currentHostSession.expiresAt);
@@ -197,25 +360,55 @@ export function reconcileHostLeadership(
     }
   }
 
-  // Pick next connected human player in slot order (0..3), or remaining active session
-  const candidates = Array.from(room.sessions.values())
-    .filter((s) => !s.revoked)
+  // Pick next connected seated human player in slot order (0..3), or remaining seated session
+  const seatedCandidates = Array.from(room.sessions.values())
+    .filter((s) => !s.revoked && !isSpectatorSession(s))
     .sort((a, b) => {
       if (a.connected !== b.connected) return a.connected ? -1 : 1;
       return a.slot - b.slot;
     });
 
-  if (candidates.length === 0) {
+  if (seatedCandidates.length === 0) {
+    // If only spectators remain and room is WAITING/FINISHED, promote first spectator into slot 0 & HOST
+    if (room.lifecycleState === 'WAITING' || room.lifecycleState === 'FINISHED') {
+      const specCandidates = getSpectatorSessions(room).sort((a, b) => {
+        if (a.connected !== b.connected) return a.connected ? -1 : 1;
+        return a.joinedAt - b.joinedAt;
+      });
+      if (specCandidates.length > 0) {
+        const nextHost = specCandidates[0];
+        nextHost.slot = 0;
+        nextHost.role = 'HOST';
+        nextHost.ready = true;
+        room.hostId = nextHost.playerId;
+        const p = room.sim.players[0];
+        p.id = nextHost.playerId;
+        p.name = nextHost.name;
+        p.cosmetic = nextHost.cosmetic;
+        p.isBot = false;
+        p.connected = nextHost.connected;
+        p.ready = true;
+        p.seatStatus = nextHost.connected ? 'CONNECTED' : 'RECONNECTING';
+        return { hostChanged: true, newHostId: nextHost.playerId };
+      }
+    }
     return { hostChanged: false, newHostId: room.hostId };
   }
 
-  const nextHost = candidates[0];
+  const nextHost = seatedCandidates[0];
   const prevHostId = room.hostId;
   for (const s of room.sessions.values()) {
+    if (isSpectatorSession(s)) {
+      s.role = 'SPECTATOR';
+      continue;
+    }
     s.role = s.playerId === nextHost.playerId ? 'HOST' : 'PLAYER';
   }
   nextHost.ready = true;
-  room.sim.players[nextHost.slot].ready = true;
+  const nextSlot = nextHost.slot;
+  if (nextSlot !== -1) {
+    room.sim.players[nextSlot].ready = true;
+  }
   room.hostId = nextHost.playerId;
 
   return { hostChanged: prevHostId !== nextHost.playerId, newHostId: nextHost.playerId };
@@ -230,7 +423,6 @@ export function updateRoomEmptyState(room: RoomRecord, nowMs = Date.now()): void
   } else if (!anyReserved) {
     room.emptySinceMs = room.emptySinceMs ?? nowMs;
   } else {
-    // Disconnected humans still inside grace window -> mark emptySinceMs so abandoned rooms still close eventually
     room.emptySinceMs = room.emptySinceMs ?? nowMs;
   }
 }

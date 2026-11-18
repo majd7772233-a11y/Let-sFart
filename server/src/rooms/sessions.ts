@@ -1,3 +1,4 @@
+import type { SeatSlotOrSpectator } from '../../../src/shared/protocol.ts';
 import type { PlayerCosmetic, PlayerRole } from '../../../src/shared/types.ts';
 import { generatePlayerId, generateSessionId } from '../lib/ids.ts';
 import { generateResumeToken, hashToken, verifyTokenHash } from '../lib/tokens.ts';
@@ -15,16 +16,22 @@ export interface IssuedSessionCredentials {
   resumeToken: string;
 }
 
+export function isSpectatorSession(session: PlayerSessionRecord): boolean {
+  return session.role === 'SPECTATOR' || session.slot < 0;
+}
+
 export class SessionManager {
   private rotatingPlayers = new Set<string>();
 
   public async createSession(opts: {
     roomCode: string;
-    slot: 0 | 1 | 2 | 3;
+    slot: SeatSlotOrSpectator;
     role: PlayerRole;
     name: string;
     cosmetic: PlayerCosmetic;
     nowMs?: number;
+    accountId?: string;
+    playerLevel?: number;
   }): Promise<IssuedSessionCredentials> {
     const nowMs = opts.nowMs ?? Date.now();
     const playerId = generatePlayerId();
@@ -43,11 +50,14 @@ export class SessionManager {
       sessionId,
       connectionEpoch: 1,
       connected: false,
-      ready: opts.role === 'HOST', // Host starts ready; non-host joins as unready per SRV-08
+      ready: opts.role === 'HOST', // Host starts ready; non-host joins as unready; spectators stay unready until promoted
       revoked: false,
+      joinedAt: nowMs,
       lastSeenAt: nowMs,
       expiresAt: nowMs + SESSION_TTL_MS,
       lastInputSeq: 0,
+      ...(opts.accountId ? { accountId: opts.accountId } : {}),
+      ...(typeof opts.playerLevel === 'number' ? { playerLevel: opts.playerLevel } : {}),
     };
 
     return { session, resumeToken };

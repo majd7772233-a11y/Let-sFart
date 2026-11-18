@@ -1,10 +1,20 @@
-import { createInitialSimState } from '../../../src/shared/physics.ts';
+import { isValidCourseId } from '../../../src/shared/course.ts';
+import { createInitialSimState, normalizeRoomSettings } from '../../../src/shared/physics.ts';
+import { buildMatchSummaryFromSim } from '../../../src/shared/progression.ts';
 import type {
+  BatchOnlineMatchParticipant,
   CreateRoomHttpRequest,
   JoinRoomHttpRequest,
+  PublicRoomListingItem,
   RoomSessionCredentials,
   ServerProtocolMessage,
 } from '../../../src/shared/protocol.ts';
+import type {
+  CourseId,
+  ReplayPlayerRosterItem,
+  RoundReplayRecord,
+  VerifiedMatchRecord,
+} from '../../../src/shared/types.ts';
 import {
   CLIENT_IP_HEADER_NAME,
   createWebSocketPair,
@@ -13,6 +23,7 @@ import {
   INTERNAL_HEADER_VALUE,
   type Env,
 } from '../env.ts';
+import { recordVerifiedMatchInD1, saveRoundReplayInD1 } from '../db/d1Store.ts';
 import { logServerEvent } from '../lib/logger.ts';
 import {
   consumeDurableTokenBucket,
@@ -30,7 +41,15 @@ import {
   makeRoomErrorMsg,
   makeRoomStateMsg,
 } from '../protocol/messages.ts';
+import type { SeatSlotOrSpectator, SpectateJoinMode } from '../../../src/shared/protocol.ts';
+import { PartyController } from '../party/PartyController.ts';
+import { ProgressionController } from '../progression/ProgressionController.ts';
+import { opsMetrics } from '../services/metrics.ts';
+import { PROGRESSION_DO_NAME, recordOnlineBatchViaService } from '../services/progressionService.ts';
+import { verifyMatchResult } from '../services/resultVerifier.ts';
+import { applyCoursePreviewToSim } from './courses.ts';
 import {
+  countActiveSpectators,
   findAvailableSeatSlot,
   getNextAlarmTimestamp,
   reconcileHostLeadership,
@@ -48,8 +67,9 @@ import {
   STATE_PERSIST_INTERVAL_MS,
   stepRoomSimulation,
 } from './simulation.ts';
-import { buildRoomPublicInfo, issueNextRoomSnapshot } from './snapshots.ts';
+import { buildPublicRoomListing, buildRoomPublicInfo, issueNextRoomSnapshot } from './snapshots.ts';
 import {
+  MAX_SPECTATORS,
   ROOM_MAX_TTL_MS,
   type RoomRecord,
   type SocketAttachment,
@@ -114,17 +134,21 @@ function writeSocketAttachment(ws: WebSocket, att: SocketAttachment): void {
 interface StoredIdempotentSessionRef {
   roomCode: string;
   playerId: string;
-  slot: 0 | 1 | 2 | 3;
+  slot: SeatSlotOrSpectator;
 }
 
 export class RaftRoom {
   private ctx: DurableObjectState;
+  private env: Env;
   private sql: SqlStorageAdapter;
   private persistence: RoomPersistence;
+  private partyController: PartyController;
+  private progressionController: ProgressionController;
   private sessions = new SessionManager();
   private rateLimiter = new SessionRateLimiter();
   private sockets = new Map<WebSocket, SocketBinding>();
   private reservedJoinSlots = new Set<0 | 1 | 2 | 3>();
+  private reservedSpectatorJoins = 0;
   private creatingRoom = false;
   private inFlightCreates = new Map<string, Promise<void>>();
   private inFlightJoins = new Map<string, Promise<void>>();
@@ -136,8 +160,9 @@ export class RaftRoom {
   private isClosing = false;
   private readyPromise: Promise<void>;
 
-  constructor(ctx: DurableObjectState, _env: Env) {
+  constructor(ctx: DurableObjectState, env: Env) {
     this.ctx = ctx;
+    this.env = env;
     const baseSql = ctx.storage.sql as unknown as SqlStorageAdapter;
     const storageAny = ctx.storage as unknown as { transactionSync?: <T>(fn: () => T) => T };
     this.sql = {
@@ -147,22 +172,41 @@ export class RaftRoom {
         : baseSql.transactionSync?.bind(baseSql),
     };
     this.persistence = new RoomPersistence(this.sql);
+    this.partyController = new PartyController(ctx, this.sql);
+    this.progressionController = new ProgressionController(this.sql);
 
     this.readyPromise = this.ctx.blockConcurrencyWhile(async () => {
-      initRoomSchema(this.sql);
       const nowMs = Date.now();
-      this.persistence.pruneExpiredRequests(nowMs);
-      this.room = this.persistence.loadRoom();
+      if (this.isProgressionDo()) {
+        this.progressionController.initIfNeeded(nowMs);
+        return;
+      }
 
-      if (this.room) {
-        this.restoreHibernatedSockets(this.room, nowMs);
-        if (shouldCloseAbandonedRoom(this.room, nowMs)) {
-          await this.closeAndPurgeRoom();
-        } else {
-          this.syncSimulationLoopState();
+      initRoomSchema(this.sql);
+      this.persistence.pruneExpiredRequests(nowMs);
+      this.partyController.initFromStorage(nowMs);
+
+      if (!this.isPartyDo()) {
+        this.room = this.persistence.loadRoom();
+
+        if (this.room) {
+          this.restoreHibernatedSockets(this.room, nowMs);
+          if (shouldCloseAbandonedRoom(this.room, nowMs)) {
+            await this.closeAndPurgeRoom();
+          } else {
+            this.syncSimulationLoopState();
+          }
         }
       }
     });
+  }
+
+  private isProgressionDo(): boolean {
+    return this.ctx.id?.name === PROGRESSION_DO_NAME;
+  }
+
+  private isPartyDo(): boolean {
+    return Boolean(this.ctx.id?.name?.startsWith('__PARTY_') || this.partyController.hasActiveParty());
   }
 
   private restoreHibernatedSockets(room: RoomRecord, nowMs: number): void {
@@ -202,11 +246,14 @@ export class RaftRoom {
 
       session.connected = true;
       session.lastSeenAt = nowMs;
-      const simPlayer = room.sim.players[session.slot];
-      if (simPlayer) {
-        simPlayer.connected = true;
-        simPlayer.isBot = false;
-        simPlayer.ready = session.ready;
+      const slot = session.slot;
+      if (slot !== -1) {
+        const simPlayer = room.sim.players[slot];
+        if (simPlayer) {
+          simPlayer.connected = true;
+          simPlayer.isBot = false;
+          simPlayer.ready = session.ready;
+        }
       }
       this.sockets.set(ws, {
         ws,
@@ -214,6 +261,7 @@ export class RaftRoom {
         playerId: session.playerId,
         sessionId: session.sessionId,
         connectionEpoch: session.connectionEpoch,
+        kind: 'room',
       });
     }
 
@@ -234,6 +282,13 @@ export class RaftRoom {
     const url = new URL(request.url);
 
     try {
+      if (url.pathname.startsWith('/internal/prog/')) {
+        this.progressionController.initIfNeeded();
+        return await this.progressionController.handleFetch(request, url);
+      }
+      if (url.pathname.startsWith('/internal/party/')) {
+        return await this.partyController.handleFetch(request, url);
+      }
       if (url.pathname === '/internal/idem-claim' && request.method === 'POST') {
         return await this.handleInternalIdemClaim(request);
       }
@@ -242,6 +297,28 @@ export class RaftRoom {
       }
       if (url.pathname === '/internal/rate-limit' && request.method === 'POST') {
         return await this.handleInternalRateLimit(request);
+      }
+      if (url.pathname === '/internal/directory/upsert' && request.method === 'POST') {
+        const listing = (await request.json()) as PublicRoomListingItem;
+        if (!listing || typeof listing.roomCode !== 'string' || !isValidRoomCode(listing.roomCode)) {
+          throw new ProtocolError('INVALID_MESSAGE', undefined, 400);
+        }
+        this.persistence.upsertPublicRoom(listing, Date.now());
+        return jsonResponse({ ok: true }, 200);
+      }
+      if (url.pathname === '/internal/directory/remove' && request.method === 'POST') {
+        const body = (await request.json()) as { roomCode?: string };
+        const code = normalizeRoomCode(body?.roomCode ?? '');
+        if (isValidRoomCode(code)) {
+          this.persistence.removePublicRoom(code);
+        }
+        return jsonResponse({ ok: true }, 200);
+      }
+      if (url.pathname === '/internal/directory/list' && request.method === 'GET') {
+        const nowMs = Date.now();
+        const rooms = this.persistence.listPublicRooms(nowMs);
+        const spectatableRooms = this.persistence.listSpectatablePublicRooms(nowMs);
+        return jsonResponse({ rooms, spectatableRooms, total: rooms.length, timestamp: nowMs }, 200);
       }
       if (url.pathname === '/internal/create' && request.method === 'POST') {
         return await this.handleInternalCreate(request);
@@ -267,6 +344,10 @@ export class RaftRoom {
 
   public async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     await this.readyPromise;
+    if (this.isPartyDo() || readSocketAttachment(ws)?.kind === 'party') {
+      await this.partyController.handleWebSocketMessage(ws, message);
+      return;
+    }
     if (this.isClosing || !this.room || this.room.lifecycleState === 'CLOSED') {
       try {
         ws.close(1000, 'ROOM_CLOSED');
@@ -286,6 +367,7 @@ export class RaftRoom {
       consumeDurableRateLimit: (key, capacity, refillPerMs, ttlMs, nowMs) =>
         consumeDurableTokenBucket(this.sql, key, capacity, refillPerMs, ttlMs, nowMs),
       sendToSocket: (targetWs, msg) => this.sendMsg(targetWs, msg),
+      broadcastMsg: (msg) => this.broadcastMsg(msg),
       broadcastState: (requestId) => {
         if (!this.room) return;
         this.broadcastMsg(makeRoomStateMsg(issueNextRoomSnapshot(this.room, Date.now()), requestId));
@@ -311,6 +393,9 @@ export class RaftRoom {
       onScheduleAlarm: () => {
         void this.scheduleNextAlarm(Date.now());
       },
+      onDirectorySync: () => {
+        void this.syncRoomDirectory(this.room);
+      },
     });
   }
 
@@ -321,12 +406,20 @@ export class RaftRoom {
     _wasClean: boolean,
   ): Promise<void> {
     await this.readyPromise;
+    if (this.isPartyDo() || readSocketAttachment(ws)?.kind === 'party') {
+      this.partyController.handleWebSocketClose(ws);
+      return;
+    }
     if (this.isClosing) return;
     this.handleSocketClosed(ws);
   }
 
   public async webSocketError(ws: WebSocket, _error: unknown): Promise<void> {
     await this.readyPromise;
+    if (this.isPartyDo() || readSocketAttachment(ws)?.kind === 'party') {
+      this.partyController.handleWebSocketClose(ws);
+      return;
+    }
     if (this.isClosing) return;
     this.handleSocketClosed(ws);
   }
@@ -342,6 +435,7 @@ export class RaftRoom {
       const snapshot = issueNextRoomSnapshot(this.room, nowMs);
       this.persistence.saveAll(this.room, nowMs);
       this.broadcastMsg(makeRoomStateMsg(snapshot));
+      void this.syncRoomDirectory(this.room);
     }
 
     if (shouldCloseAbandonedRoom(this.room, nowMs)) {
@@ -397,6 +491,7 @@ export class RaftRoom {
     for (const id of expiredIds) {
       this.persistence.deleteSession(id);
       room.sessions.delete(id);
+      delete room.courseVotes[id];
       this.rateLimiter.clear(id);
       logServerEvent('player_expired', {
         roomCode: room.roomCode,
@@ -412,6 +507,9 @@ export class RaftRoom {
       });
     }
 
+    if (room.lifecycleState === 'WAITING') {
+      applyCoursePreviewToSim(room);
+    }
     syncBotsInRoom(room, nowMs);
     updateRoomEmptyState(room, nowMs);
     return true;
@@ -514,7 +612,11 @@ export class RaftRoom {
   }
 
   private async handleInternalCreate(request: Request): Promise<Response> {
-    const body = (await request.json()) as CreateRoomHttpRequest & { roomCode: string };
+    const body = (await request.json()) as CreateRoomHttpRequest & {
+      roomCode: string;
+      accountId?: string;
+      playerLevel?: number;
+    };
     const roomCode = normalizeRoomCode(body.roomCode ?? '');
     if (!isValidRoomCode(roomCode)) {
       throw new ProtocolError('INVALID_ROOM_CODE', undefined, 400);
@@ -563,15 +665,38 @@ export class RaftRoom {
     try {
       const hostName = sanitizePlayerName(body.name, 'قبطان');
       const hostCosmetic = sanitizeCosmeticOrDefault(body.cosmetic, 0);
+      const initialCourseId: CourseId = isValidCourseId(body.courseId) ? body.courseId : 'tropical';
+      const isPrivate = Boolean(body.isPrivate);
+      let passwordHash: string | null = null;
+      if (isPrivate) {
+        const rawPwd = typeof body.password === 'string' ? body.password.trim() : '';
+        if (rawPwd.length < 3 || rawPwd.length > 32) {
+          throw new ProtocolError('INVALID_MESSAGE', 'كلمة مرور الغرفة الخاصة يجب أن تكون بين 3 و32 حرفًا.', 400);
+        }
+        passwordHash = await hashToken(`${roomCode}:pwd:${rawPwd}`);
+      }
+      const settings = normalizeRoomSettings(body.settings);
+      const hostAccountId = typeof body.accountId === 'string' && body.accountId.length > 0 ? body.accountId : undefined;
+      const hostLevel = typeof body.playerLevel === 'number' && body.playerLevel > 0 ? body.playerLevel : undefined;
 
-      const sim = createInitialSimState('online', hostName, hostCosmetic);
+      const sim = createInitialSimState('online', hostName, hostCosmetic, initialCourseId, settings);
       sim.phase = 'waiting';
 
       const room: RoomRecord = {
         roomCode,
         lifecycleState: 'CREATING',
+        roundSeq: 1,
         hostId: '',
         fillBots: true,
+        isPrivate,
+        passwordHash,
+        settings,
+        courseId: initialCourseId,
+        courseSelectionMode: 'host',
+        courseVotes: {},
+        playlistQueue: [],
+        recentChat: [],
+        emoteSeq: 0,
         idempotencyKey,
         createdAt: nowMs,
         updatedAt: nowMs,
@@ -592,6 +717,8 @@ export class RaftRoom {
         name: hostName,
         cosmetic: hostCosmetic,
         nowMs,
+        accountId: hostAccountId,
+        playerLevel: hostLevel,
       });
 
       room.hostId = issued.session.playerId;
@@ -599,6 +726,8 @@ export class RaftRoom {
       room.sim.players[0].id = issued.session.playerId;
       room.sim.players[0].connected = false;
       room.sim.players[0].ready = true;
+      if (hostAccountId) room.sim.players[0].accountId = hostAccountId;
+      if (hostLevel) room.sim.players[0].playerLevel = hostLevel;
 
       syncBotsInRoom(room, nowMs);
       transitionRoomLifecycle(room, 'WAITING');
@@ -623,10 +752,13 @@ export class RaftRoom {
         );
       }
       await this.scheduleNextAlarm(nowMs);
+      await this.syncRoomDirectory(room);
 
       logServerEvent('room_created', {
         roomCode,
         hostId: issued.session.playerId,
+        isPrivate,
+        gameMode: settings.gameMode,
       });
 
       const creds: RoomSessionCredentials = {
@@ -659,15 +791,29 @@ export class RaftRoom {
         throw new ProtocolError('RATE_LIMITED', undefined, 429);
       }
     }
-    const body = (await request.json()) as JoinRoomHttpRequest;
+    const body = (await request.json()) as JoinRoomHttpRequest & {
+      accountId?: string;
+      playerLevel?: number;
+    };
+    const joinAccountId = typeof body.accountId === 'string' && body.accountId.length > 0 ? body.accountId : undefined;
+    const joinLevel = typeof body.playerLevel === 'number' && body.playerLevel > 0 ? body.playerLevel : undefined;
     const idempotencyKey =
       typeof body.idempotencyKey === 'string' && body.idempotencyKey.trim().length > 0
         ? body.idempotencyKey.trim().slice(0, 128)
         : null;
 
+    if (room.isPrivate && room.passwordHash) {
+      const candidatePwd = typeof body.password === 'string' ? body.password.trim() : '';
+      const candidateHash = candidatePwd ? await hashToken(`${room.roomCode}:pwd:${candidatePwd}`) : '';
+      if (!candidateHash || candidateHash !== room.passwordHash) {
+        throw new ProtocolError('INVALID_PASSWORD', ERROR_MESSAGES_AR.INVALID_PASSWORD, 403);
+      }
+    }
+
     const expiredChanged = this.cleanupExpiredSessions(room, nowMs);
     if (expiredChanged) {
       this.persistence.saveAll(room, nowMs);
+      void this.syncRoomDirectory(room);
     }
 
     if (idempotencyKey) {
@@ -690,17 +836,42 @@ export class RaftRoom {
       }
     }
 
-    // Reserve seat synchronously BEFORE any await so concurrent join requests cannot claim the same slot
-    const openSlot = findAvailableSeatSlot(room, nowMs, this.reservedJoinSlots);
-    if (openSlot === null) {
-      if (expiredChanged) {
-        const snap = issueNextRoomSnapshot(room, nowMs);
-        this.broadcastMsg(makeRoomStateMsg(snap));
+    const spectateMode: SpectateJoinMode =
+      body.spectate === 'only' || body.spectate === 'auto' ? body.spectate : 'never';
+
+    // Reserve seat OR spectator slot synchronously BEFORE any await so concurrent join requests cannot collide
+    let openSlot: SeatSlotOrSpectator | null = null;
+    let joiningAsSpectator = false;
+
+    if (spectateMode === 'only') {
+      joiningAsSpectator = true;
+      openSlot = -1;
+    } else {
+      const canTakeSeat = spectateMode === 'never' || room.lifecycleState === 'WAITING';
+      const seat = canTakeSeat ? findAvailableSeatSlot(room, nowMs, this.reservedJoinSlots) : null;
+      if (seat !== null) {
+        openSlot = seat;
+      } else if (spectateMode === 'auto') {
+        joiningAsSpectator = true;
+        openSlot = -1;
+      } else {
+        if (expiredChanged) {
+          const snap = issueNextRoomSnapshot(room, nowMs);
+          this.broadcastMsg(makeRoomStateMsg(snap));
+        }
+        throw new ProtocolError('ROOM_FULL', undefined, 409);
       }
-      throw new ProtocolError('ROOM_FULL', undefined, 409);
     }
 
-    this.reservedJoinSlots.add(openSlot);
+    if (joiningAsSpectator) {
+      if (countActiveSpectators(room) + this.reservedSpectatorJoins >= MAX_SPECTATORS) {
+        throw new ProtocolError('ROOM_FULL', 'وصل عدد المشاهدين في الغرفة إلى الحد الأقصى.', 409);
+      }
+      this.reservedSpectatorJoins += 1;
+    } else if (openSlot !== null && openSlot !== -1) {
+      this.reservedJoinSlots.add(openSlot);
+    }
+
     let resolveInFlight: (() => void) | undefined;
     if (idempotencyKey) {
       const p = new Promise<void>((r) => {
@@ -710,20 +881,29 @@ export class RaftRoom {
     }
 
     try {
-      const cleanName = sanitizePlayerName(body.name, `لاعب ${openSlot + 1}`);
-      const cleanCosmetic = sanitizeCosmeticOrDefault(body.cosmetic, openSlot);
+      const seatNum = joiningAsSpectator ? countActiveSpectators(room) + 1 : (openSlot as number) + 1;
+      const cleanName = sanitizePlayerName(
+        body.name,
+        joiningAsSpectator ? `مشاهد ${seatNum}` : `لاعب ${seatNum}`,
+      );
+      const cleanCosmetic = sanitizeCosmeticOrDefault(
+        body.cosmetic,
+        joiningAsSpectator ? 0 : (openSlot as number),
+      );
 
       const currentHost = room.sessions.get(room.hostId);
       const hasValidHost = Boolean(currentHost && !currentHost.revoked);
-      const assignedRole = hasValidHost ? 'PLAYER' : 'HOST';
+      const assignedRole = joiningAsSpectator ? 'SPECTATOR' : hasValidHost ? 'PLAYER' : 'HOST';
 
       const issued = await this.sessions.createSession({
         roomCode: room.roomCode,
-        slot: openSlot,
+        slot: openSlot as SeatSlotOrSpectator,
         role: assignedRole,
         name: cleanName,
         cosmetic: cleanCosmetic,
         nowMs,
+        accountId: joinAccountId,
+        playerLevel: joinLevel,
       });
 
       if (this.isClosing || this.room !== room || room.lifecycleState === 'CLOSED') {
@@ -763,6 +943,7 @@ export class RaftRoom {
         );
       }
       await this.scheduleNextAlarm(nowMs);
+      await this.syncRoomDirectory(room);
 
       logServerEvent('player_joined', {
         roomCode: room.roomCode,
@@ -784,7 +965,11 @@ export class RaftRoom {
       };
       return jsonResponse(creds, 200);
     } finally {
-      this.reservedJoinSlots.delete(openSlot);
+      if (joiningAsSpectator) {
+        this.reservedSpectatorJoins = Math.max(0, this.reservedSpectatorJoins - 1);
+      } else if (openSlot !== null && openSlot !== -1) {
+        this.reservedJoinSlots.delete(openSlot);
+      }
       if (idempotencyKey) {
         this.inFlightJoins.delete(idempotencyKey);
         resolveInFlight?.();
@@ -862,12 +1047,17 @@ export class RaftRoom {
       const nowMs = Date.now();
       session.connected = false;
       session.lastSeenAt = nowMs;
+      opsMetrics.recordDisconnect();
 
-      const simPlayer = this.room.sim.players[session.slot];
-      if (simPlayer) {
-        simPlayer.connected = false;
-        simPlayer.farting = false;
-        simPlayer.moveDir = 0;
+      const slot = session.slot;
+      if (slot !== -1) {
+        const simPlayer = this.room.sim.players[slot];
+        if (simPlayer) {
+          simPlayer.connected = false;
+          simPlayer.tempBotSubstitute = false;
+          simPlayer.farting = false;
+          simPlayer.moveDir = 0;
+        }
       }
 
       // Host keeps HOST role during 15s grace window
@@ -884,6 +1074,7 @@ export class RaftRoom {
       });
 
       this.broadcastMsg(makeRoomStateMsg(snapshot));
+      void this.syncRoomDirectory(this.room);
       void this.scheduleNextAlarm(nowMs);
     }
 
@@ -944,7 +1135,7 @@ export class RaftRoom {
       return;
     }
 
-    const { events, lifecycleChanged } = stepRoomSimulation(room, rawDt, nowMs);
+    const { events, lifecycleChanged, tempSubChanged } = stepRoomSimulation(room, rawDt, nowMs);
     const afterStepLifecycle = (room as { lifecycleState: RoomRecord['lifecycleState'] }).lifecycleState;
     if (events.length > 0) {
       const discrete = events.filter((e) => e.type !== 'fart_start' && e.type !== 'fart_stop');
@@ -959,20 +1150,22 @@ export class RaftRoom {
         elapsedTime: room.sim.elapsedTime,
         falls: room.sim.falls,
       });
+      this.recordFinishedRoundForParticipants(room);
     }
 
     const periodicPersistDue = nowMs - (room.lastPersistedAtMs ?? 0) >= STATE_PERSIST_INTERVAL_MS;
-    if (metaDirty || lifecycleChanged) {
+    if (metaDirty || lifecycleChanged || tempSubChanged) {
       this.persistence.saveAll(room, nowMs);
+      void this.syncRoomDirectory(room);
     } else if (periodicPersistDue) {
       this.persistence.saveSimState(room, nowMs);
     }
 
-    if (metaDirty || lifecycleChanged || nowMs - this.lastBroadcastMs >= SNAPSHOT_BROADCAST_INTERVAL_MS) {
+    if (metaDirty || lifecycleChanged || tempSubChanged || nowMs - this.lastBroadcastMs >= SNAPSHOT_BROADCAST_INTERVAL_MS) {
       this.lastBroadcastMs = nowMs;
       const snapshot = issueNextRoomSnapshot(room, nowMs);
       this.broadcastMsg(
-        metaDirty || lifecycleChanged ? makeRoomStateMsg(snapshot) : makeGameSnapshotMsg(snapshot),
+        metaDirty || lifecycleChanged || tempSubChanged ? makeRoomStateMsg(snapshot) : makeGameSnapshotMsg(snapshot),
       );
     }
 
@@ -1055,13 +1248,186 @@ export class RaftRoom {
     }
 
     if (closingRoomCode) {
+      await this.syncRoomDirectory(null, closingRoomCode);
       logServerEvent('room_closed', { roomCode: closingRoomCode });
+    }
+  }
+
+  private async syncRoomDirectory(
+    room: RoomRecord | null,
+    removedRoomCode?: string,
+  ): Promise<void> {
+    if (this.ctx.id?.name === '__ROOM_DIRECTORY' || this.isPartyDo() || this.isProgressionDo()) return;
+
+    if (!room || room.lifecycleState === 'CLOSED') {
+      const deadCode = room?.roomCode ?? removedRoomCode;
+      if (deadCode) opsMetrics.removeRoom(deadCode);
+    } else {
+      let humanCount = 0;
+      let botCount = 0;
+      let tempSubstituteCount = 0;
+      let spectatorCount = 0;
+      for (const s of room.sessions.values()) {
+        if (s.revoked) continue;
+        if (s.slot === -1) {
+          if (s.connected) spectatorCount += 1;
+        } else if (s.connected) {
+          humanCount += 1;
+        }
+      }
+      for (const p of room.sim.players) {
+        if (p.tempBotSubstitute) tempSubstituteCount += 1;
+        else if (p.isBot && p.connected) botCount += 1;
+      }
+      opsMetrics.updateRoomSummary({
+        roomCode: room.roomCode,
+        courseId: room.courseId,
+        gameMode: room.settings.gameMode,
+        lifecycleState: room.lifecycleState,
+        humanCount,
+        botCount,
+        tempSubstituteCount,
+        spectatorCount,
+        updatedAt: Date.now(),
+      });
+    }
+
+    if (!this.env?.ROOMS) return;
+    const code = room?.roomCode ?? removedRoomCode;
+    if (!code) return;
+
+    try {
+      const dirStub = this.env.ROOMS.get(this.env.ROOMS.idFromName('__ROOM_DIRECTORY'));
+      if (!room || room.isPrivate || room.lifecycleState === 'CLOSED') {
+        await dirStub.fetch(
+          new Request('https://raft-room.internal/internal/directory/remove', {
+            method: 'POST',
+            headers: {
+              [INTERNAL_HEADER_NAME]: INTERNAL_HEADER_VALUE,
+              'content-type': 'application/json',
+            },
+            body: JSON.stringify({ roomCode: code }),
+          }),
+        );
+      } else {
+        const listing = buildPublicRoomListing(room);
+        await dirStub.fetch(
+          new Request('https://raft-room.internal/internal/directory/upsert', {
+            method: 'POST',
+            headers: {
+              [INTERNAL_HEADER_NAME]: INTERNAL_HEADER_VALUE,
+              'content-type': 'application/json',
+            },
+            body: JSON.stringify(listing),
+          }),
+        );
+      }
+    } catch {
+      // Directory sync is best-effort and must never fail room gameplay
+    }
+  }
+
+  private recordFinishedRoundForParticipants(room: RoomRecord): void {
+    if (this.isProgressionDo() || this.isPartyDo()) return;
+    const nowMs = Date.now();
+    const roundSeq = room.roundSeq ?? 1;
+    const submissionKey = `online:${room.roomCode}:r${roundSeq}`;
+    const matchId = submissionKey;
+
+    const participants: BatchOnlineMatchParticipant[] = [];
+    const seenAccounts = new Set<string>();
+
+    for (const session of room.sessions.values()) {
+      if (session.revoked || session.slot < 0 || !session.accountId) continue;
+      if (seenAccounts.has(session.accountId)) continue;
+      seenAccounts.add(session.accountId);
+      const match = buildMatchSummaryFromSim(room.sim, session.slot as 0 | 1 | 2 | 3, submissionKey);
+      participants.push({
+        accountId: session.accountId,
+        match,
+      });
+    }
+
+    const baseSummary = buildMatchSummaryFromSim(room.sim, 0, submissionKey);
+    const verification = verifyMatchResult(baseSummary, { isAuthoritativeRoom: true });
+
+    const roster: ReplayPlayerRosterItem[] = room.sim.players.map((p) => ({
+      slot: p.slot,
+      name: p.name,
+      isBot: p.isBot,
+      botPersonality: p.botPersonality,
+      wasTempSubstitute: Boolean(p.tempBotSubstitute),
+      colorIndex: p.cosmetic.colorIndex,
+      pushContribution: Math.round(p.stats.pushImpulseSum ?? 0),
+    }));
+
+    const replayRecord: RoundReplayRecord = {
+      matchId,
+      roomCode: room.roomCode,
+      mode: 'online',
+      courseId: room.courseId,
+      gameMode: room.settings.gameMode,
+      difficulty: room.settings.difficulty,
+      botDifficulty: room.settings.botDifficulty,
+      outcome: room.sim.runOutcome,
+      durationSec: Number((room.sim.elapsedTime ?? 0).toFixed(2)),
+      falls: room.sim.falls ?? 0,
+      treasureScore: room.sim.treasureScore ?? 0,
+      survivalDistance: Math.round(room.sim.survivalDistance ?? 0),
+      minRaftHp: Math.round(room.sim.minRaftHp ?? room.sim.raftHp ?? 100),
+      createdAt: nowMs,
+      players: roster,
+      frames: (room.replayFrames ?? []).slice(),
+      events: (room.replayEvents ?? []).slice(),
+    };
+
+    const jobs: Promise<unknown>[] = [];
+    if (verification.ok) {
+      const verifiedRecord: VerifiedMatchRecord = {
+        matchId,
+        submissionKey,
+        roomCode: room.roomCode,
+        accountId: participants[0]?.accountId ?? null,
+        mode: 'online',
+        courseId: room.courseId,
+        gameMode: room.settings.gameMode,
+        difficulty: room.settings.difficulty,
+        outcome: room.sim.runOutcome,
+        elapsedTimeSec: baseSummary.elapsedTimeSec,
+        falls: baseSummary.falls,
+        itemsUsed: room.sim.itemsCollectedCount ?? baseSummary.itemsUsed,
+        collisionCount: room.sim.collisionCount ?? 0,
+        treasureScore: baseSummary.treasureScore,
+        survivalDistance: baseSummary.survivalDistance,
+        minRaftHp: baseSummary.minRaftHp,
+        verifiedAt: nowMs,
+      };
+      jobs.push(recordVerifiedMatchInD1(this.env?.DB, verifiedRecord));
+    } else {
+      opsMetrics.recordVerificationRejection();
+    }
+
+    if (replayRecord.frames.length > 0) {
+      jobs.push(saveRoundReplayInD1(this.env?.DB, replayRecord));
+    }
+
+    if (this.env?.ROOMS && participants.length > 0) {
+      jobs.push(recordOnlineBatchViaService(this.env, participants));
+    }
+
+    if (jobs.length === 0) return;
+    const allJobs = Promise.allSettled(jobs);
+    if (typeof this.ctx.waitUntil === 'function') {
+      this.ctx.waitUntil(allJobs);
+    } else {
+      void allJobs;
     }
   }
 
   public dispose(): void {
     this.isClosing = true;
     this.stopLoop();
+    this.partyController.dispose();
     for (const ws of Array.from(this.sockets.keys())) {
       try {
         ws.close(1000, 'DISPOSED');
