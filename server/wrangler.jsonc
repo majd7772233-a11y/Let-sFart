@@ -26,7 +26,8 @@
     {
       "binding": "DB",
       "database_name": "letsfart-db",
-      "database_id": "local-dev-db"
+      "database_id": "c8755c17-7349-4368-85d2-82386415b5c1",
+      "migrations_dir": "migrations"
     }
   ]
 }
