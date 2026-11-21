@@ -471,7 +471,7 @@ async function startServer() {
   }, 33);
 
   server.listen(PORT, '0.0.0.0', () => {
-    console.log(`Crazy Raft server listening on http://localhost:${PORT}`);
+    console.log(`Let’s Fart server listening on http://localhost:${PORT}`);
   });
 }
 

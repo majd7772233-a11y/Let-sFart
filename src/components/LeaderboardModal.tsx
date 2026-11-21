@@ -91,7 +91,7 @@ export const LeaderboardModal: React.FC<LeaderboardModalProps> = ({
                   · {data.total} متنافس
                 </>
               ) : (
-                'تصنيف أبطال الطوف المجنونة'
+                'تصنيف أبطال Let’s Fart'
               )}
             </p>
           </div>

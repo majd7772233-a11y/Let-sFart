@@ -224,7 +224,7 @@ class OpsMetricsCollector {
 
     return {
       ok: true,
-      service: 'crazy-raft-worker',
+      service: 'letsfart-worker',
       runtime: options.runtime,
       gameVersion: GAME_VERSION,
       protocolVersion: PROTOCOL_VERSION,

@@ -163,7 +163,7 @@ async function startLocalServer(): Promise<void> {
   });
 
   server.listen(PORT, '0.0.0.0', () => {
-    console.log(`Crazy Raft Worker/DO local server listening on http://localhost:${PORT}`);
+    console.log(`Let’s Fart Worker/DO local server listening on http://localhost:${PORT}`);
   });
 }
 

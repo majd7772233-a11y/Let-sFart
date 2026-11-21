@@ -177,8 +177,8 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
                 <circle cx="49" cy="37" r="3.2" fill="#14222f" />
                 <circle cx="59" cy="38" r="2.8" fill="#14222f" />
               </svg>
-              <h1 className="text-3xl sm:text-6xl font-black text-[#ffd13b] cartoon-outline leading-tight">
-                الطوف المجنونة
+              <h1 dir="ltr" className="text-3xl sm:text-6xl font-black text-[#ffd13b] cartoon-outline leading-tight">
+                Let’s Fart
               </h1>
             </div>
             <p className="text-xs sm:text-base font-bold text-[#fff8e7] cartoon-outline-sm max-w-md">
